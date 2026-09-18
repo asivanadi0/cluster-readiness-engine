@@ -42,7 +42,9 @@ By default the Helm chart is pulled from GHCR at the CLI's own version, so a tag
 nvcrectl setup init --version <chart-version>
 ```
 
-The image and chart are public on GHCR, so no token is needed. For a private fork on GHCR, `--image-pull-secret <github-token>` creates the `nvcrectl-pull-secret` image pull secret in the `nvcre` namespace and authenticates chart pulls from GHCR. For a chart hosted on a private non-GHCR mirror, run `helm registry login <mirror>` before `setup init` instead. Use `--skip-phases=deps` when Kubeflow Trainer is already installed, and `--auto-approve` to skip the confirmation prompt in CI. On clusters that cannot reach GHCR at all, `--chart-ref` and `--trainer-chart-ref` point both chart pulls at a mirror registry; see [Restricted egress and air-gapped installs](#restricted-egress-and-air-gapped-installs).
+The image and chart are public on GHCR, so no token is needed. For a private fork on GHCR, `--image-pull-secret <github-token>` creates the `nvcrectl-pull-secret` image pull secret in the `nvcre` namespace and authenticates chart pulls from GHCR. For a chart hosted on a private non-GHCR mirror, run `helm registry login <mirror>` before `setup init` instead. Use `--skip-phases=deps` when Kubeflow Trainer is already installed, `--skip-phases=helm` to run only dependency setup, and `--auto-approve` to skip the confirmation prompt in CI. Unknown phase names are rejected. On clusters that cannot reach GHCR at all, `--chart-ref` and `--trainer-chart-ref` point both chart pulls at a mirror registry; see [Restricted egress and air-gapped installs](#restricted-egress-and-air-gapped-installs).
+
+Before installing or upgrading Trainer, `setup init` checks the shared JobSet CRD and correlates the supported JobSet controller fingerprints with live resources and the exact Trainer release manifest. A verified external JobSet controller makes Trainer install with `jobset.install=false`; a bundled controller stays bundled. An orphaned JobSet CRD with no controller, supporting resources, release evidence, or JobSets keeps the CRD and installs the bundled controller without refreshing the CRD schema. An existing Trainer release with a missing JobSet CRD stops with repair guidance because Helm does not restore a chart CRD during upgrade. Ambiguous or unreadable ownership stops before Helm mutation and prints the manual Trainer installation followed by the `nvcrectl setup init --skip-phases=deps` path. The bounded fingerprint scan covers the published chart pattern, not arbitrary customized controllers; operators who cannot establish that assumption must manage the Trainer installation explicitly. Operator-managed Trainer and JobSet installations are responsible for compatible Trainer and JobSet CRD schemas, controllers, external consumers, and any required migrations. Automatic reconciliation of the shared JobSet CRD is deferred work that needs its own design, covering schema compatibility, stored-version migration, and coordination with external controllers and workloads.
 
 Check the installation at any time:
 
@@ -79,7 +81,9 @@ Key chart values:
 | `manager.image.digest` | `""` | Pin the controller image by digest. Wins over `tag`; the only form that names the exact bytes you verified |
 | `manager.imagePullSecrets` | `[]` | Pull secrets for the controller image |
 | `manager.resources` | `10m/500m` CPU, `1Gi/1Gi` memory | Controller resource requests/limits |
-| `manager.affinity` | `{}` | Controller pod affinity |
+| `manager.affinity` | `{}` | Replace the complete controller affinity; when empty, the chart prefers spreading replicas across nodes |
+| `pdb.enabled` | `false` | Create a controller PodDisruptionBudget |
+| `pdb.minAvailable` | `1` | Minimum ready controller pods during voluntary eviction; integer or percentage |
 | `metrics.port` | `8443` | Controller metrics port |
 | `metrics.serviceMonitor.enabled` | `true` | Install a `ServiceMonitor` (requires the Prometheus Operator CRDs; set to `false` on clusters without them) |
 
@@ -151,7 +155,55 @@ manager:
   replicas: 2
 ```
 
-Only one replica holds the leader lease at a time. Standby replicas take over automatically if the leader fails. No additional configuration is required.
+Only one replica holds the leader lease at a time. Standby replicas take over automatically if the leader fails, with a temporary reconciliation gap while leadership is acquired. Existing workloads continue independently if their nodes remain healthy.
+
+### Node maintenance and disruption protection
+
+To retain a ready controller replica during voluntary evictions such as `kubectl drain`, enable the optional PodDisruptionBudget (PDB). `nvcrectl setup init` currently has no PDB configuration flags, so manage these values through a direct Helm install or upgrade, or through your GitOps values.
+
+```yaml
+manager:
+  replicas: 2
+pdb:
+  enabled: true
+  minAvailable: 1
+```
+
+By default, the chart gives controller replicas a preferred pod anti-affinity rule for `kubernetes.io/hostname`. The scheduler spreads replicas across nodes when possible but may co-locate them when necessary. A non-empty `manager.affinity` replaces that complete default; it is not merged with the preferred rule.
+
+**Upgrade note:** Earlier chart versions rendered no affinity when `manager.affinity` was empty. Upgrading from those versions with empty `manager.affinity` adds preferred hostname anti-affinity and triggers a controller Deployment rollout, even if `pdb.enabled` is false. With multiple replicas, the scheduler prefers placing them on different nodes, but still permits co-location and scheduling on a single-node cluster.
+
+For a hard HA guarantee, include both infrastructure-node placement and required pod anti-affinity in the override. The example below assumes infrastructure nodes carry the `node-role.kubernetes.io/infra` label; replace that key with the label used by your cluster. Set `app.kubernetes.io/instance` to your Helm release name and `app.kubernetes.io/name` to the chart's rendered name label (`nvcre` by default; adjust it if you change `nameOverride`). Both should match the controller Deployment's selector:
+
+```yaml
+manager:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/infra
+                operator: Exists
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nvcre
+              app.kubernetes.io/instance: nvcre
+              control-plane: manager
+          topologyKey: kubernetes.io/hostname
+```
+
+The default preferred rule does not guarantee separation, so both replicas may still share a node. During a drain, one pod can be evicted, but the PDB then waits for the Deployment to schedule and ready a replacement elsewhere before allowing the other eviction. If no replacement can become Ready, the drain remains blocked. Co-location also leaves both replicas exposed to an involuntary failure of that node, which a PDB cannot prevent.
+
+This placement requires at least two eligible infrastructure nodes. For rolling upgrades with two replicas, provide a third eligible node with capacity for a controller pod. The chart does not set a Deployment strategy, so the Kubernetes rolling-update defaults allow one surge pod and zero unavailable pods at this replica count. On exactly two nodes, the required anti-affinity also matches the old replicas, leaving the surge pod Pending and the rollout stalled. If only two nodes are available, retain preferred anti-affinity, or customize the Deployment's `spec.strategy.rollingUpdate.maxUnavailable` to `1` through your deployment tooling. The chart does not expose this strategy setting as a Helm value; allowing one unavailable replica also temporarily reduces redundancy during upgrades.
+
+The PDB can still allow eviction of the leader; it preserves a ready replica, not uninterrupted reconciliation or process memory. It does not protect against node failure, direct pod deletion, or Deployment rolling updates.
+
+With **one replica and `minAvailable: 1`, the PDB blocks node drains even when no Certification is running**. Before maintenance, either scale to two and wait for a ready replica on another node, or arrange a maintenance window, temporarily disable the PDB (or set `minAvailable: 0`), and restore protection after the replacement is ready. Completing a Certification does not automatically relax the budget. The PDB is disabled by default to preserve existing maintenance behavior.
+
+More generally, voluntary eviction of a healthy controller pod is blocked while the current ready replica count is at or below the required minimum. For example, two replicas with `minAvailable: 2` or `minAvailable: "100%"` leave no room for voluntary eviction. Percentage minimums are calculated from the desired replica count and rounded up to a whole number of pods.
 
 ## RBAC requirements
 
@@ -324,15 +376,17 @@ If you installed with `nvcrectl setup init`, upgrade by installing the new CLI v
 nvcrectl setup reset
 ```
 
-`setup reset` runs three phases: **cr** (deletes all NVCRE custom resource instances while the controller can still process finalizers), **helm** (removes the NVCRE Helm release and then explicitly deletes the NVCRE CRDs), and **deps** (removes Kubeflow Trainer and its CRDs). Use `--skip-phases=deps` to keep Kubeflow Trainer.
+`setup reset` runs three phases: **cr** (deletes all NVCRE custom resource instances while the controller can still process finalizers), **helm** (removes the NVCRE Helm release and then explicitly deletes the NVCRE CRDs), and **deps** (removes Kubeflow Trainer and its Trainer-owned CRDs). Use `--skip-phases=deps` to keep Kubeflow Trainer, or `--skip-phases=cr,helm` to run only dependency removal. A Trainer Helm uninstall error stops reset before CRD cleanup and returns a nonzero result; rerun after resolving the Helm, API, timeout, or finalizer failure.
 
 **What `setup reset` retains** — clean these up yourself if you want a pristine cluster:
 
 - The `nvcre` and `kubeflow-system` namespaces are not deleted.
 - The `nvcrectl-pull-secret` image pull secret created by `setup init --image-pull-secret` remains in the `nvcre` namespace.
+- The shared `jobsets.jobset.x-k8s.io` CRD remains. Deleting it destroys every JobSet in every namespace, so `setup reset` reports it without printing a cleanup command. Assess all cluster-wide consumers and follow the owning JobSet release's CRD upgrade or removal procedure.
 
 ```bash
-# Removes both retained namespaces (and the pull secret inside them)
+# Removes both retained namespaces (and the pull secret inside them).
+# Inventory kubeflow-system first; it may contain externally managed resources.
 kubectl delete namespace nvcre kubeflow-system
 ```
 
@@ -362,7 +416,7 @@ Use this checklist before going live. Each item addresses a specific risk surfac
 | **Network policy** | Required | Restrict egress to the Kubernetes API server and DNS only. No NetworkPolicy ships with the chart — add one for your environment. |
 | **RBAC audit** | Required | Run `kubectl get clusterrole nvcre-manager-role -o yaml` and verify the permissions match your security requirements. |
 | **TLS for metrics** | Recommended | The default ServiceMonitor uses `insecureSkipVerify: true`. Configure cert-manager to issue a serving certificate for the controller's metrics endpoint. |
-| **Controller node affinity** | Recommended | Schedule the controller on infrastructure nodes, not GPU nodes, using the `manager.affinity` chart value to avoid consuming GPU resources. |
+| **Controller node affinity** | Recommended | Schedule the controller on infrastructure nodes, not GPU nodes, using `manager.affinity`. This value replaces the chart's complete default affinity, so include pod anti-affinity in the override when running multiple replicas. |
 | **Image provenance** | Recommended | Verify the image signature and its SLSA provenance against the exact signing identity before deploying, then pin what you verified with `--set manager.image.digest=sha256:...` rather than deploying by tag — a tag can be repointed after you check it. The provenance names the commit, ref and workflow that built it. See [Verifying release artifacts](./verifying-artifacts.md). Scan images with your vulnerability tooling before deployment. |
 | **Pod Security Standards** | Verify | The controller runs as non-root with `seccompProfile: RuntimeDefault`, a read-only root filesystem, and all capabilities dropped. Verify with `kubectl get pod -n nvcre -o yaml`. |
 | **CRD backup** | Recommended | Include the NVCRE CRDs in your cluster backup strategy. Certification resources contain node health state that may be needed for audit. |
