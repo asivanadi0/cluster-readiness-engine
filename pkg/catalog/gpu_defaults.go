@@ -5,9 +5,14 @@ package catalog
 
 import (
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/NVIDIA/cluster-readiness-engine/pkg/gpu"
 )
 
 // NodeDefaults holds per-node hardware counts for a GPU architecture.
@@ -23,10 +28,20 @@ type NodeDefaults struct {
 // node shape and is the safest default for unknown hardware.
 const fallbackGpusPerNode int32 = 4
 
+// nodeDefaultsOverride is one platformOverrides entry. Its fields are pointers
+// so an absent field (fall through to the architecture default) is
+// distinguishable from an explicit 0 (a platform that wants none), which a
+// plain int32 cannot express. NodeDefaults keeps value fields: it is the
+// resolved result, where 0 is just a count.
+type nodeDefaultsOverride struct {
+	GpusPerNode *int32 `json:"gpusPerNode" yaml:"gpusPerNode"`
+	MlnxPerNode *int32 `json:"mlnxPerNode" yaml:"mlnxPerNode"`
+}
+
 // gpuDefaultsData is the parsed shape of entries/_lib/gpu-defaults.yaml.
 type gpuDefaultsData struct {
-	Defaults          map[string]NodeDefaults            `json:"defaults" yaml:"defaults"`
-	PlatformOverrides map[string]map[string]NodeDefaults `json:"platformOverrides" yaml:"platformOverrides"`
+	Defaults          map[string]NodeDefaults                    `json:"defaults" yaml:"defaults"`
+	PlatformOverrides map[string]map[string]nodeDefaultsOverride `json:"platformOverrides" yaml:"platformOverrides"`
 }
 
 var (
@@ -51,7 +66,9 @@ func LoadGPUDefaults() error {
 // GPUDefaults returns node hardware defaults for the given GPU architecture
 // and platform. Platform overrides (e.g. OCI L40s) are applied on top of
 // architecture defaults — only fields explicitly set in the platform override
-// take effect; unset fields fall through to the architecture defaults.
+// take effect; unset fields fall through to the architecture defaults. An
+// explicit 0 is a value like any other, so a platform may override an
+// architecture's non-zero mlnxPerNode down to none (e.g. OCI GB200).
 //
 // Unknown architectures get {GpusPerNode: fallbackGpusPerNode, MlnxPerNode: 0}.
 // An empty platform skips override resolution and returns architecture defaults
@@ -73,13 +90,32 @@ func GPUDefaults(gpuArch, platform string) NodeDefaults {
 	if !ok {
 		return nd
 	}
-	if override.GpusPerNode != 0 {
-		nd.GpusPerNode = override.GpusPerNode
+	if override.GpusPerNode != nil {
+		nd.GpusPerNode = *override.GpusPerNode
 	}
-	if override.MlnxPerNode != 0 {
-		nd.MlnxPerNode = override.MlnxPerNode
+	if override.MlnxPerNode != nil {
+		nd.MlnxPerNode = *override.MlnxPerNode
 	}
 	return nd
+}
+
+// ParseGPUArchFlag normalizes a --gpu-arch flag value with gpu.ParseProduct,
+// so "gb300", "NVIDIA-GB300" and "NVIDIA GB300" are equivalent, and rejects
+// an architecture gpu-defaults.yaml does not list: GPUDefaults would silently
+// fall back for it and no gpuArchitecture override would match. An empty
+// flag is allowed (architecture not specified); a non-empty one that
+// normalizes to empty, e.g. "NVIDIA-", is rejected.
+func ParseGPUArchFlag(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	arch := gpu.ParseProduct(value)
+	ensureGPUDefaultsLoaded()
+	if _, ok := gpuDefaults.Defaults[arch]; !ok {
+		return "", fmt.Errorf("invalid --gpu-arch %q: must be one of %s",
+			value, strings.Join(slices.Sorted(maps.Keys(gpuDefaults.Defaults)), ", "))
+	}
+	return arch, nil
 }
 
 // ensureGPUDefaultsLoaded loads entries/_lib/gpu-defaults.yaml on first call

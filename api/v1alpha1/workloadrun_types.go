@@ -149,10 +149,25 @@ type WorkloadOrchestration struct {
 	// testScale controls the node grouping strategy.
 	//   - "intra-node": each node tested independently (numNodes=1 per job)
 	//   - "intra-rack": one job per topology domain (nvidia.com/gpu.clique)
-	//   - "full-scale": all nodes in a single group (default)
+	//   - "full-scale" (default): every target node is covered by some job, in
+	//     groups of numNodes. To run a single job of numNodes and leave the rest
+	//     of the fleet untouched, set placement: Unpinned.
 	// +optional
 	// +kubebuilder:validation:Enum=intra-node;intra-rack;full-scale
 	TestScale string `json:"testScale,omitempty"`
+
+	// placement controls whether jobs are pinned to specific nodes.
+	//   - "Pinned" (default): every target node is partitioned into groups of
+	//     numNodes and each job is pinned to its group by hostname.
+	//   - "Unpinned": exactly one job of exactly numNodes nodes runs, no matter
+	//     how many nodes the target matches, with no hostname pinning. The
+	//     scheduler places the pods, constrained to the target by node affinity.
+	//
+	// Incompatible with testScale: intra-node and intra-rack, which ask for a
+	// different number of jobs. See ADR-089.
+	// +optional
+	// +kubebuilder:validation:Enum=Pinned;Unpinned
+	Placement string `json:"placement,omitempty"`
 
 	// repeatCount runs the entire orchestration N times. Default: 1.
 	// +optional
@@ -210,6 +225,9 @@ type WorkloadRunSpec struct {
 	// Used by platforms with InfiniBand or RoCE networking (Azure, OCI, TogetherAI).
 	// If not specified, derived from GPU architecture and platform via the
 	// catalog's gpu-defaults.yaml.
+	// Setting it to 0 is an opt-out, not a request for zero devices: the Azure
+	// override stops requesting nvidia.com/mlnxnics altogether rather than
+	// emitting a count of zero.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MlnxPerNode *int32 `json:"mlnxPerNode,omitempty"`

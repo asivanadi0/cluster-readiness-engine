@@ -61,8 +61,8 @@ func TestDiscoverCordonedNodes(t *testing.T) {
 			given = append(given, node)
 		}
 
-		nodes, cordoned, err := discoverTargetNodes(context.Background(),
-			unorderedReader{nodes: given},
+		nodes, cordoned, _, err := discoverTargetNodes(context.Background(),
+			unorderedReader{nodes: given}, nil,
 			input.Target)
 		if err != nil {
 			return err

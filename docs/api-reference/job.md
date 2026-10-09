@@ -14,6 +14,9 @@ description: CRD reference for the Job resource.
 |-------|------|-------------|
 | `workload` | WorkloadSpec | Required, immutable. Discriminated union selecting the workload framework; exactly one field must be set |
 | `workloadMetadata` | WorkloadMetadata | Optional, immutable. Labels applied to the generated workload object itself (see below) |
+| `nodeHealthMonitor` | NodeHealthMonitor | Optional, immutable in presence and value. Configures node-health monitoring |
+| `goodputMeasurement` | GoodputMeasurementConfig | Optional, immutable in presence and value. Configures goodput measurement |
+| `bandwidthMeasurement` | BandwidthMeasurementConfig | Optional, immutable in presence and value. Configures bandwidth measurement |
 | `workloadMetadata.labels` | map[string]string | Optional. At most 32 entries. Label keys must be valid Kubernetes label keys and values valid Kubernetes label values; `app.kubernetes.io/managed-by` and any key under `nvcre.nvidia.com/` are rejected |
 
 ### Workload object labels
@@ -52,13 +55,17 @@ The resulting `TrainJob` carries those three labels plus the two the controller 
 
 **Immutability.** `workloadMetadata` cannot be added, removed, or changed after the Job is created; all three are rejected by CRD transition rules. A checkpoint restart therefore recreates the workload with the labels it was originally admitted with, so a restart cannot land the workload in a different queue than the one that admitted it. To change the labels, create a new Job (or a new `WorkloadRun`/`Certification`).
 
+**Measurement configuration immutability.** `nodeHealthMonitor`, `goodputMeasurement`, and `bandwidthMeasurement` are each immutable in both presence and value. An optional field omitted when the Job is created cannot be added later, and a configured field cannot be removed or changed. Other mutable Job fields remain editable.
+
 ## Status fields
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `conditions` | []Condition | Exclusive set: `InProgress`, `Succeeded`, `Failed`. Independent (additive): `HardwareFailed` (can be True alongside execution state), `ValidationFailed` (can be True alongside `Succeeded`) |
+| `conditions` | []Condition | Exclusive set: `InProgress` (`WorkloadCreated`, `WorkloadPending`, `WorkloadRunning`, `WorkloadSchedulingBlocked`, `WorkloadRestarting`), `Succeeded`, `Failed` (`WorkloadFailed`, `WorkloadStalled`, plus Workflow-set `JobTimedOut`). Independent (additive): `HardwareFailed` (can be True alongside execution state), `ValidationFailed` (can be True alongside `Succeeded`) |
 | `workloadRef` | WorkloadReference | Reference to the created workload (`TrainJob`) |
 | `workloadStartTime` | Time | When the workload was first observed running rather than pending (e.g. suspended by Kueue). `timeoutPerJob` is measured from this timestamp, and the stall clock never starts before it, so queued time counts against neither. Cleared on checkpoint restart |
+| `schedulingBlockedSince` | Time | When the workload's pods were first observed unschedulable (`PodScheduled=False/Unschedulable`) in the current blocked episode. Cleared when no pod is blocked. While set, the `timeoutPerJob` clock is paused at this instant and stall detection is skipped; past the grace window the Job reports `InProgress` with reason `WorkloadSchedulingBlocked`. The pause is bounded: an episode that lasts longer than `timeoutPerJob` times the Job out. On recovery `workloadStartTime` is advanced by the paused interval, so runtime consumed before the block still counts. See [ADR-083](../designs/083-scheduling-stall-visibility.md) |
+| `schedulingResumedTime` | Time | When the most recent scheduling-blocked episode ended. Startup- and training-stall detection measure from this instant when it is later than their own anchor (application start, or the last observed step). See [ADR-083](../designs/083-scheduling-stall-visibility.md) |
 | `failedNodes` | []FailedNode | Nodes identified as failed; each entry has `name`, `reason`, and optional `message` |
 | `restartCount` | int32 | Number of checkpoint-based restarts |
 | `failureLog` | FailureLog | Tail of pod logs from the most recent failure (pod name, node, exit code, log tail) |
@@ -72,6 +79,7 @@ Each `FailedNode` entry has:
 | `message` | string | Detailed failure message |
 
 `GoodputMeasurement` and `BandwidthMeasurement` resources reference the Job via their own `spec.jobRef` — the Job does not hold references to them.
+If the workload is admitted but its pods cannot be placed, the `InProgress` condition carries reason `WorkloadSchedulingBlocked` and the message relays the scheduler's own diagnosis from the pod's `PodScheduled` condition. Blocked time does not count against `timeoutPerJob` or stall detection, but a single blocked episode longer than `timeoutPerJob` times the Job out, so a Job whose pods can never schedule still terminates; the grace window before the reason surfaces is tunable via `spec.schedulingStallGraceSeconds` (default 5 minutes). See [ADR-083](../designs/083-scheduling-stall-visibility.md).
 
 ## Naming
 

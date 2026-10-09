@@ -47,6 +47,14 @@ spec:
             values:
             - gcp-h100-node-01
             - gcp-h100-node-02
+          - key: nvidia.com/gpu.present
+            operator: In
+            values:
+            - "true"
+          - key: nvidia.com/gpu.product
+            operator: In
+            values:
+            - NVIDIA-H100-80GB-HBM3
   containers:
   - args:
     - -N
@@ -70,9 +78,9 @@ spec:
     - -x
     - NCCL_CROSS_NIC=0
     - -x
-    - NCCL_ALGO=Ring,Tree
+    - NCCL_PROTO=Simple,LL128
     - -x
-    - NCCL_PROTO=Simple
+    - NCCL_NVLSTREE_MAX_CHUNKSIZE=131072
     - -x
     - NCCL_MIN_NCHANNELS=4
     - -x
@@ -142,7 +150,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: nvcr.io/nvidia/pytorch:26.01-py3
+    image: nvcr.io/nvidia/pytorch:25.06-py3
     imagePullPolicy: IfNotPresent
     name: node
     resources:
@@ -183,7 +191,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: nvcr.io/nvidia/pytorch:26.01-py3
+    image: nvcr.io/nvidia/pytorch:25.06-py3
     imagePullPolicy: IfNotPresent
     name: fix-ssh-permissions
     resources: {}
@@ -277,7 +285,7 @@ metadata:
     jobset.sigs.k8s.io/replicatedjob-replicas: "1"
     jobset.sigs.k8s.io/restart-attempt: "0"
     networking.gke.io/default-interface: eth0
-    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"},{"interfaceName":"eth1","network":"gpu-nic0"},{"interfaceName":"eth2","network":"gpu-nic1"},{"interfaceName":"eth3","network":"gpu-nic2"},{"interfaceName":"eth4","network":"gpu-nic3"},{"interfaceName":"eth5","network":"gpu-nic4"},{"interfaceName":"eth6","network":"gpu-nic5"},{"interfaceName":"eth7","network":"gpu-nic6"},{"interfaceName":"eth8","network":"gpu-nic7"}]'
+    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"},{"interfaceName":"eth1","network":"nvcre-uat-gpu-nic-0"},{"interfaceName":"eth2","network":"nvcre-uat-gpu-nic-1"},{"interfaceName":"eth3","network":"nvcre-uat-gpu-nic-2"},{"interfaceName":"eth4","network":"nvcre-uat-gpu-nic-3"},{"interfaceName":"eth5","network":"nvcre-uat-gpu-nic-4"},{"interfaceName":"eth6","network":"nvcre-uat-gpu-nic-5"},{"interfaceName":"eth7","network":"nvcre-uat-gpu-nic-6"},{"interfaceName":"eth8","network":"nvcre-uat-gpu-nic-7"}]'
   finalizers:
   - batch.kubernetes.io/job-tracking
   generateName: gcp-h100-nccl-communicati-76790-job-workload-node-0-0-
@@ -315,6 +323,14 @@ spec:
             values:
             - gcp-h100-node-01
             - gcp-h100-node-02
+          - key: nvidia.com/gpu.present
+            operator: In
+            values:
+            - "true"
+          - key: nvidia.com/gpu.product
+            operator: In
+            values:
+            - NVIDIA-H100-80GB-HBM3
   containers:
   - args:
     - |-
@@ -337,7 +353,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: nvcr.io/nvidia/pytorch:26.01-py3
+    image: nvcr.io/nvidia/pytorch:25.06-py3
     imagePullPolicy: IfNotPresent
     name: node
     readinessProbe:
@@ -380,7 +396,7 @@ spec:
     - |
       set -ex
       chmod 755 /fts/entrypoint_rxdm_container.sh
-      /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8 --uid= --alsologtostderr --enforce_kernel_ipv6_support=false
+      /fts/entrypoint_rxdm_container.sh --num_hops=2
     command:
     - /bin/sh
     - -c
@@ -392,7 +408,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.8
+    image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
     imagePullPolicy: Always
     name: tcpxo-daemon
     resources: {}
@@ -400,8 +416,8 @@ spec:
     securityContext:
       capabilities:
         add:
-        - CAP_NET_ADMIN
-        - CAP_NET_BIND_SERVICE
+        - NET_ADMIN
+        - NET_BIND_SERVICE
     terminationMessagePath: /dev/termination-log
     terminationMessagePolicy: File
     volumeMounts:
@@ -503,7 +519,7 @@ metadata:
     jobset.sigs.k8s.io/replicatedjob-replicas: "1"
     jobset.sigs.k8s.io/restart-attempt: "0"
     networking.gke.io/default-interface: eth0
-    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"},{"interfaceName":"eth1","network":"gpu-nic0"},{"interfaceName":"eth2","network":"gpu-nic1"},{"interfaceName":"eth3","network":"gpu-nic2"},{"interfaceName":"eth4","network":"gpu-nic3"},{"interfaceName":"eth5","network":"gpu-nic4"},{"interfaceName":"eth6","network":"gpu-nic5"},{"interfaceName":"eth7","network":"gpu-nic6"},{"interfaceName":"eth8","network":"gpu-nic7"}]'
+    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"},{"interfaceName":"eth1","network":"nvcre-uat-gpu-nic-0"},{"interfaceName":"eth2","network":"nvcre-uat-gpu-nic-1"},{"interfaceName":"eth3","network":"nvcre-uat-gpu-nic-2"},{"interfaceName":"eth4","network":"nvcre-uat-gpu-nic-3"},{"interfaceName":"eth5","network":"nvcre-uat-gpu-nic-4"},{"interfaceName":"eth6","network":"nvcre-uat-gpu-nic-5"},{"interfaceName":"eth7","network":"nvcre-uat-gpu-nic-6"},{"interfaceName":"eth8","network":"nvcre-uat-gpu-nic-7"}]'
   finalizers:
   - batch.kubernetes.io/job-tracking
   generateName: gcp-h100-nccl-communicati-76790-job-workload-node-0-1-
@@ -541,6 +557,14 @@ spec:
             values:
             - gcp-h100-node-01
             - gcp-h100-node-02
+          - key: nvidia.com/gpu.present
+            operator: In
+            values:
+            - "true"
+          - key: nvidia.com/gpu.product
+            operator: In
+            values:
+            - NVIDIA-H100-80GB-HBM3
   containers:
   - args:
     - |-
@@ -563,7 +587,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: nvcr.io/nvidia/pytorch:26.01-py3
+    image: nvcr.io/nvidia/pytorch:25.06-py3
     imagePullPolicy: IfNotPresent
     name: node
     readinessProbe:
@@ -606,7 +630,7 @@ spec:
     - |
       set -ex
       chmod 755 /fts/entrypoint_rxdm_container.sh
-      /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8 --uid= --alsologtostderr --enforce_kernel_ipv6_support=false
+      /fts/entrypoint_rxdm_container.sh --num_hops=2
     command:
     - /bin/sh
     - -c
@@ -618,7 +642,7 @@ spec:
         fieldRef:
           apiVersion: v1
           fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
-    image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.8
+    image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
     imagePullPolicy: Always
     name: tcpxo-daemon
     resources: {}
@@ -626,8 +650,8 @@ spec:
     securityContext:
       capabilities:
         add:
-        - CAP_NET_ADMIN
-        - CAP_NET_BIND_SERVICE
+        - NET_ADMIN
+        - NET_BIND_SERVICE
     terminationMessagePath: /dev/termination-log
     terminationMessagePolicy: File
     volumeMounts:

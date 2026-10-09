@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,6 +30,7 @@ import (
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/catalog"
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/cluster"
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/controller"
+	"github.com/NVIDIA/cluster-readiness-engine/pkg/gpu"
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/naming"
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/platform"
 	"github.com/NVIDIA/cluster-readiness-engine/pkg/render"
@@ -104,6 +105,7 @@ func newCertificationRenderCommand() *cobra.Command {
 	var outputFormat string
 	var dryRun bool
 	var platformFlag string
+	var gpuArchFlag string
 
 	configFlags := kubeconfig.NewConfigFlags(true)
 	*configFlags.Namespace = defaultKubeNamespace
@@ -117,7 +119,12 @@ With --dry-run, connects to a cluster, applies overrides per Workflow,
 and validates resolved resources via server-side dry-run.
 
 Use --platform to simulate platform-specific overrides (e.g., EFA volumes
-on AWS) without connecting to a cluster. Valid values: %s.`, platform.NamesList()),
+on AWS) without connecting to a cluster. Valid values: %s.
+
+Use --gpu-arch to set the GPU architecture offline (e.g. a DRA-only GPU
+stack whose nodes carry no nvidia.com/gpu.product label). It wins over the
+nodeSelector-derived value when set and cannot be combined with --dry-run,
+which detects the architecture from real nodes.`, platform.NamesList()),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -126,7 +133,7 @@ on AWS) without connecting to a cluster. Valid values: %s.`, platform.NamesList(
 						"Usage: nvcrectl certification render [flags] <certification.yaml>",
 				)
 			}
-			return runCertificationRender(args[0], outputFormat, dryRun, configFlags, platformFlag)
+			return runCertificationRender(args[0], outputFormat, dryRun, configFlags, platformFlag, gpuArchFlag)
 		},
 	}
 
@@ -135,16 +142,26 @@ on AWS) without connecting to a cluster. Valid values: %s.`, platform.NamesList(
 		"Connect to cluster, discover real nodes, and validate via server-side dry-run")
 	cmd.Flags().StringVar(&platformFlag, "platform", "",
 		"Simulate platform for override matching ("+platform.NamesList()+")")
+	cmd.Flags().StringVar(&gpuArchFlag, "gpu-arch", "",
+		"GPU architecture for offline render; wins over the target nodeSelector's nvidia.com/gpu.product label")
 	configFlags.AddFlags(cmd.Flags())
 
 	return cmd
 }
 
 func runCertificationRender(certFile, outputFormat string, dryRun bool,
-	configFlags *kubeconfig.ConfigFlags, platformFlag string) error {
+	configFlags *kubeconfig.ConfigFlags, platformFlag, gpuArchFlag string) error {
 	namespace := *configFlags.Namespace
 
 	if err := platform.ValidateFlag(platformFlag); err != nil {
+		return err
+	}
+
+	if dryRun && gpuArchFlag != "" {
+		return errors.New("--dry-run detects the GPU architecture from cluster nodes; cannot combine with --gpu-arch")
+	}
+	gpuArchOverride, err := catalog.ParseGPUArchFlag(gpuArchFlag)
+	if err != nil {
 		return err
 	}
 
@@ -154,9 +171,19 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 	}
 
 	// When --dry-run, connect early so we can auto-detect GPU architecture
-	// from cluster nodes if not specified in the nodeSelector.
+	// from cluster nodes if not specified in the nodeSelector. The result is
+	// kept in gpuArchOverride, never written back into
+	// cert.Spec.Target.NodeSelector: that is the real API-level selector
+	// discoverTargetNodes uses for every future reconcile of this
+	// Certification.
 	var dryRunClient client.Client
 	var dryRunNodes []corev1.Node
+	// Names of the nodes whose nvidia.com/gpu.product label discovery synthesized
+	// from ResourceSlices. The affinity build in DryRunCreate needs it, because a
+	// term matching a synthesized value would match nothing on this very cluster.
+	var synthesizedProducts []string
+	var gkeTCPXONetworks []string
+	var tcpxoPluginVersion string
 	if dryRun {
 		var cErr error
 		dryRunClient, cErr = render.NewK8sClient(configFlags)
@@ -170,10 +197,7 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 			if gpuErr != nil {
 				return gpuErr
 			}
-			if cert.Spec.Target.NodeSelector == nil {
-				cert.Spec.Target.NodeSelector = make(map[string]string)
-			}
-			cert.Spec.Target.NodeSelector["nvidia.com/gpu.product"] = gpuProduct
+			gpuArchOverride = gpu.ParseProduct(gpuProduct)
 		}
 
 		// Discover the target nodes up front: NIC resource auto-detection
@@ -183,14 +207,17 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 		// (no --dry-run) has no cluster and stays field-only.
 		ctx := context.Background()
 		var nodesErr error
-		dryRunNodes, nodesErr = controller.DiscoverTargetNodes(ctx, dryRunClient, &cert.Spec.Target)
+		dryRunNodes, synthesizedProducts, nodesErr = controller.DiscoverTargetNodesWithSynthesized(
+			ctx, dryRunClient, &cert.Spec.Target)
 		if nodesErr != nil {
 			return fmt.Errorf("discover nodes: %w", nodesErr)
 		}
 		applyNICDetection(cert, dryRunNodes, platformFlag)
+		gkeTCPXONetworks = detectGKETCPXONetworks(dryRunNodes, platformFlag)
+		tcpxoPluginVersion = detectTCPXOPluginVersion(ctx, dryRunClient, dryRunNodes, platformFlag)
 	}
 
-	workflows, err := renderCertification(cert, platformFlag)
+	workflows, err := renderCertification(cert, platformFlag, gpuArchOverride, gkeTCPXONetworks, tcpxoPluginVersion)
 	if err != nil {
 		return err
 	}
@@ -207,7 +234,8 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 		nodes := dryRunNodes
 		if len(nodes) == 0 {
 			var nErr error
-			nodes, nErr = controller.DiscoverTargetNodes(ctx, dryRunClient, workflows[0].Spec.Orchestration.Target)
+			nodes, synthesizedProducts, nErr = controller.DiscoverTargetNodesWithSynthesized(
+				ctx, dryRunClient, workflows[0].Spec.Orchestration.Target)
 			if nErr != nil {
 				return fmt.Errorf("discover nodes: %w", nErr)
 			}
@@ -225,7 +253,8 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 				return err
 			}
 
-			results, dryRunErr := render.DryRunCreate(ctx, dryRunClient, namespace, &workflows[i].Spec, nodes)
+			results, dryRunErr := render.DryRunCreate(
+				ctx, dryRunClient, namespace, &workflows[i].Spec, nodes, synthesizedProducts)
 			if dryRunErr != nil {
 				return fmt.Errorf("dry-run workflow %s: %w", workflows[i].Name, dryRunErr)
 			}
@@ -234,7 +263,7 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 				results: results,
 			})
 		}
-	} else if err := resolveWorkflowsOffline(cert, workflows, platformFlag); err != nil {
+	} else if err := resolveWorkflowsOffline(cert, workflows, platformFlag, gpuArchOverride); err != nil {
 		return err
 	}
 
@@ -270,12 +299,12 @@ func runCertificationRender(certFile, outputFormat string, dryRun bool,
 // The synthetic node lets GPU-architecture-specific overrides (images, env
 // vars) apply even without connecting to a real cluster.
 func resolveWorkflowsOffline(
-	cert *nvcrev1alpha1.Certification, workflows []nvcrev1alpha1.Workflow, platformFlag string,
+	cert *nvcrev1alpha1.Certification, workflows []nvcrev1alpha1.Workflow, platformFlag, gpuArchOverride string,
 ) error {
-	syntheticNodes := []corev1.Node{syntheticRenderNode(platformFlag, cert.Spec.Target.NodeSelector)}
+	syntheticNodes := []corev1.Node{syntheticRenderNode(platformFlag, cert.Spec.Target.NodeSelector, gpuArchOverride)}
 	for i := range workflows {
 		if _, err := render.ResolveWorkflow(&workflows[i], syntheticNodes); err != nil {
-			return fmt.Errorf("resolve overrides for %s: %w", workflows[i].Name, err)
+			return fmt.Errorf("resolve workflow %s: %w", workflows[i].Name, err)
 		}
 		if err := applyWorkflowTransforms(cert, workflows, i); err != nil {
 			return err
@@ -371,20 +400,109 @@ func applyNICDetection(cert *nvcrev1alpha1.Certification, nodes []corev1.Node, p
 	cert.Spec.NicResourceName = &name
 }
 
+// detectGKETCPXONetworks resolves the GKE networks the GCP H100 TCPXO patch
+// attaches for the dry-run render path, mirroring the certification
+// controller: detection runs only for GCP H100 targets, and only exactly
+// catalog.GKETCPXONICsPerNode networks allocatable on every target node are
+// used. Otherwise it prints the note the controller emits as a
+// GKENetworkDetection event and returns nil, so the catalog default renders.
+//
+// platformFlag (--platform) wins over node-based detection for the gate, as
+// in applyNICDetection, and the same divergence applies: this path detects
+// against every discovered target node with the majority architecture, the
+// controller against the arch-filtered set. The two agree on a homogeneous
+// fleet.
+func detectGKETCPXONetworks(nodes []corev1.Node, platformFlag string) []string {
+	if len(nodes) == 0 {
+		return nil
+	}
+	platformName := controller.DetectPlatform(nodes)
+	if platformFlag != "" {
+		platformName = platformFlag
+	}
+	names, refusalMessage, ran := controller.ResolveGKETCPXONetworks(
+		platformName, controller.DetectGPUArchitecture(nodes), nodes)
+	if !ran {
+		return nil
+	}
+	if len(names) == 0 {
+		_, _ = fmt.Fprintln(os.Stderr, refusalMessage)
+		return nil
+	}
+	_, _ = fmt.Fprintf(os.Stderr,
+		"Auto-detected GKE TCPXO networks %s (allocatable on every target node)\n", strings.Join(names, ", "))
+	return names
+}
+
+// detectTCPXOPluginVersion resolves the TCPXO plugin release that picks the
+// GCP H100 workload and tcpxo-daemon images for the dry-run render path,
+// mirroring the certification controller: detection runs only for GCP H100
+// targets, and only one release tag on every target node's installer pod is
+// used. An unmapped or missing release prints the note the controller emits
+// as a TCPXOPluginDetection event; the catalog then renders the nearest safe
+// profile for the returned version ("" renders the minimum).
+//
+// The same gate and node-set divergence as detectGKETCPXONetworks applies.
+func detectTCPXOPluginVersion(ctx context.Context, reader client.Reader, nodes []corev1.Node, platformFlag string) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	platformName := controller.DetectPlatform(nodes)
+	if platformFlag != "" {
+		platformName = platformFlag
+	}
+	version, fallbackMessage, ran := controller.ResolveTCPXOPluginVersion(
+		ctx, reader, platformName, controller.DetectGPUArchitecture(nodes), nodes)
+	if !ran {
+		return ""
+	}
+	if fallbackMessage != "" {
+		_, _ = fmt.Fprintln(os.Stderr, fallbackMessage)
+		return version
+	}
+	profile, release, _ := catalog.TCPXOPluginProfileFor(version)
+	detected := version
+	if release != version {
+		detected += " (release " + release + ")"
+	}
+	_, _ = fmt.Fprintf(os.Stderr,
+		"Auto-detected TCPXO plugin %s on every target node: NCCL image %s, training image %s, tcpxo-daemon %s\n",
+		detected, profile.NCCLImage, profile.TrainingImage, profile.DaemonImage)
+	return version
+}
+
 // renderCertification builds all Workflows that the controller would create
 // from catalog entries for the given Certification. The platform argument
 // (from --platform or detected from cluster nodes) is used to resolve
 // platform-specific node defaults like OCI L40s {gpusPerNode: 4, mlnxPerNode: 2}
 // at template-render time. Pass "" to use architecture defaults only.
-func renderCertification(cert *nvcrev1alpha1.Certification, platformName string) ([]nvcrev1alpha1.Workflow, error) {
+//
+// gpuArchOverride, an architecture as returned by gpu.ParseProduct (from
+// --gpu-arch, or detected under --dry-run), wins over the nodeSelector's
+// nvidia.com/gpu.product label when set: offline render has no cluster to fall
+// back to ResourceSlices, so a label-less (DRA-only) platform needs an
+// explicit architecture.
+//
+// gkeTCPXONetworks are the GKE networks detected under --dry-run
+// (detectGKETCPXONetworks), and tcpxoPluginVersion is the TCPXO plugin
+// release detected there (detectTCPXOPluginVersion). Nil and "" render the
+// catalog defaults, which is what an offline render without a cluster always
+// gets.
+func renderCertification(
+	cert *nvcrev1alpha1.Certification, platformName, gpuArchOverride string, gkeTCPXONetworks []string,
+	tcpxoPluginVersion string,
+) ([]nvcrev1alpha1.Workflow, error) {
 	if len(cert.Spec.Categories) == 0 {
 		return nil, fmt.Errorf("certification has no categories")
 	}
 
-	gpuArch := catalog.GPUArchFromNodeSelector(cert.Spec.Target.NodeSelector)
+	gpuArch := gpuArchOverride
+	if gpuArch == "" {
+		gpuArch = catalog.GPUArchFromNodeSelector(cert.Spec.Target.NodeSelector)
+	}
 	if gpuArch == "" {
 		return nil, fmt.Errorf(
-			"cannot determine GPU architecture from target nodeSelector" +
+			"cannot determine GPU architecture from target nodeSelector or --gpu-arch" +
 				" (nvidia.com/gpu.product label is required)",
 		)
 	}
@@ -433,28 +551,31 @@ func renderCertification(cert *nvcrev1alpha1.Certification, platformName string)
 		}
 
 		workflowSpec, buildErr := entry.Build(cert.Spec.Target, catalog.BuildConfig{
-			ImagePullSecrets:   opts.ImagePullSecrets,
-			StorageClassName:   opts.StorageClassName,
-			NodesPerJob:        nodesPerJob,
-			GpusPerNode:        gpusPerNode,
-			MlnxPerNode:        mlnxPerNode,
-			NicResourceName:    nicResourceName,
-			Resources:          opts.Resources,
-			EnableMNNVL:        enableMNNVL,
-			EnableCheckpoint:   derefBoolPtr(opts.EnableCheckpoint),
-			MaxSteps:           derefInt32Ptr(opts.MaxSteps),
-			ExitDurationMins:   derefInt32Ptr(opts.ExitDurationMins),
-			GPUArchitecture:    gpuArch,
-			SaveInterval:       derefInt32Ptr(opts.SaveInterval),
-			SaveRetainInterval: derefInt32Ptr(opts.SaveRetainInterval),
-			SaveTopK:           derefInt32Ptr(opts.SaveTopK),
-			StorageSize:        opts.StorageSize,
-			TestScale:          opts.TestScale,
-			MaxBytes:           opts.MaxBytes,
-			NumIterations:      derefInt32Ptr(opts.NumIterations),
-			NumCycles:          derefInt32Ptr(opts.NumCycles),
-			Thresholds:         opts.Thresholds,
-			MaxConcurrent:      derefInt32Ptr(opts.MaxConcurrent),
+			ImagePullSecrets:           opts.ImagePullSecrets,
+			StorageClassName:           opts.StorageClassName,
+			NodesPerJob:                nodesPerJob,
+			GpusPerNode:                gpusPerNode,
+			MlnxPerNode:                mlnxPerNode,
+			NicResourceName:            nicResourceName,
+			GKETCPXONetworks:           gkeTCPXONetworks,
+			TCPXOPluginVersion:         tcpxoPluginVersion,
+			Resources:                  opts.Resources,
+			EnableMNNVL:                enableMNNVL,
+			EnableCheckpoint:           derefBoolPtr(opts.EnableCheckpoint),
+			MaxSteps:                   derefInt32Ptr(opts.MaxSteps),
+			ExitDurationMins:           derefInt32Ptr(opts.ExitDurationMins),
+			StartupStallTimeoutSeconds: derefInt32Ptr(opts.StartupStallTimeoutSeconds),
+			GPUArchitecture:            gpuArch,
+			SaveInterval:               derefInt32Ptr(opts.SaveInterval),
+			SaveRetainInterval:         derefInt32Ptr(opts.SaveRetainInterval),
+			SaveTopK:                   derefInt32Ptr(opts.SaveTopK),
+			StorageSize:                opts.StorageSize,
+			TestScale:                  opts.TestScale,
+			MaxBytes:                   opts.MaxBytes,
+			NumIterations:              derefInt32Ptr(opts.NumIterations),
+			NumCycles:                  derefInt32Ptr(opts.NumCycles),
+			Thresholds:                 opts.Thresholds,
+			MaxConcurrent:              derefInt32Ptr(opts.MaxConcurrent),
 			// These five were missing, so render previewed catalog defaults
 			// rather than the user's settings. certification_controller.go
 			// passes all of them, which is why an applied run was correct while
@@ -547,34 +668,35 @@ func platformToProviderID(platformName string) string {
 }
 
 // syntheticRenderNode builds the fake node used to resolve overrides when
-// rendering offline. The node carries the Certification's nodeSelector labels
-// plus whatever providerID, labels, and allocatable resources platform
-// detection needs to map the node back to the requested platform.
-func syntheticRenderNode(platformName string, nodeSelector map[string]string) corev1.Node {
-	node := corev1.Node{
-		Labels: nodeSelector,
+// rendering offline. The node carries a defensive copy of the Certification's
+// nodeSelector labels — never the caller's map directly, since gpuArchOverride
+// and the platform-specific branches below mutate it, and the Certification's
+// real Target.NodeSelector must never be corrupted by an offline render — plus
+// whatever providerID and labels platform detection needs to map the node back
+// to the requested platform.
+//
+// gpuArchOverride, an architecture as returned by gpu.ParseProduct (from
+// --gpu-arch), replaces the nodeSelector's nvidia.com/gpu.product label when
+// set, matching renderCertification: offline render has no cluster to read
+// ResourceSlices from, so a DRA-only platform that carries no gpu.product
+// label on real nodes needs an explicit architecture to resolve gpuArchitecture
+// overrides at all.
+func syntheticRenderNode(platformName string, nodeSelector map[string]string, gpuArchOverride string) corev1.Node {
+	labels := make(map[string]string, len(nodeSelector)+1)
+	maps.Copy(labels, nodeSelector)
+	if gpuArchOverride != "" {
+		labels[gpu.ProductLabel] = "NVIDIA-" + gpuArchOverride
 	}
+	node := corev1.Node{Labels: labels}
 	if platformName == "" {
 		return node
 	}
 	node.Spec.ProviderID = platformToProviderID(platformName)
 	switch platformName {
 	case platform.TogetherAI:
-		if node.Labels == nil {
-			node.Labels = map[string]string{}
-		}
 		node.Labels["node-role.together.ai/worker"] = ""
 	case platform.Forge:
-		if node.Labels == nil {
-			node.Labels = map[string]string{}
-		}
 		node.Labels["kubernetes.io/hostname"] = "synthetic-forge-node"
-	case platform.NScale:
-		// Detection maps openstack:// to nscale only when the node also
-		// reports the nscale.com/rdmashare allocatable.
-		node.Status.Allocatable = corev1.ResourceList{
-			"nscale.com/rdmashare": resource.MustParse("8"),
-		}
 	}
 	return node
 }
@@ -609,20 +731,21 @@ type certRunConfig struct {
 // categoryRunOpts holds the optional CategoryOptions flags for the --category path.
 // Bool pointers are nil when the user did not pass the flag (use controller default).
 type categoryRunOpts struct {
-	enableCheckpoint *bool
-	maxSteps         int32
-	exitDurationMins int32
-	gpusPerNode      int32
-	enableMNNVL      *bool
-	storageClass     string
-	repeatCount      int32
-	maxRestarts      int32
+	enableCheckpoint           *bool
+	maxSteps                   int32
+	exitDurationMins           int32
+	startupStallTimeoutSeconds int32
+	gpusPerNode                int32
+	enableMNNVL                *bool
+	storageClass               string
+	repeatCount                int32
+	maxRestarts                int32
 }
 
 func newRunCommand(version string) *cobra.Command {
 	var categories []string
 	var name string
-	var nodesPerJob, maxSteps, exitDurationMins, gpusPerNode, repeatCount, maxRestarts int32
+	var nodesPerJob, maxSteps, exitDurationMins, startupStallTimeoutSeconds, gpusPerNode, repeatCount, maxRestarts int32
 	var enableCheckpoint, enableMNNVL bool
 	var storageClass string
 	var doWait, doSetup, doCleanup bool
@@ -650,6 +773,9 @@ Use --wait to watch for completion and print a report.
 Use --cleanup to teardown installed components after completion.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := kubeconfig.ValidateWaitTimeout(timeout, doWait); err != nil {
+				return err
+			}
 			if certFile != "" && len(categories) > 0 {
 				return fmt.Errorf("--cert-file and --category are mutually exclusive")
 			}
@@ -665,6 +791,14 @@ Use --cleanup to teardown installed components after completion.`,
 			if pullSet > 0 && pullSet < 3 {
 				return fmt.Errorf("--workload-registry, --workload-registry-username, and --workload-registry-password must all be set together and non-empty")
 			}
+			if certFile != "" && cmd.Flags().Changed("startup-stall-timeout-seconds") {
+				return fmt.Errorf("--startup-stall-timeout-seconds cannot be used with --cert-file; " +
+					"set it in the Certification YAML")
+			}
+			if cmd.Flags().Changed("startup-stall-timeout-seconds") && startupStallTimeoutSeconds < 0 {
+				return fmt.Errorf("--startup-stall-timeout-seconds must not be negative (got %d); "+
+					"use 0 for the catalog entry's default", startupStallTimeoutSeconds)
+			}
 			if certFile == "" && len(categories) == 0 {
 				return fmt.Errorf("either --cert-file or at least one --category is required\n\n" +
 					"Use 'nvcrectl certification list-categories' to see available categories")
@@ -678,12 +812,13 @@ Use --cleanup to teardown installed components after completion.`,
 					doWait, doSetup, doCleanup, timeout, configFlags, os.Stderr)
 			} else {
 				opts := categoryRunOpts{
-					maxSteps:         maxSteps,
-					exitDurationMins: exitDurationMins,
-					gpusPerNode:      gpusPerNode,
-					storageClass:     storageClass,
-					repeatCount:      repeatCount,
-					maxRestarts:      maxRestarts,
+					maxSteps:                   maxSteps,
+					exitDurationMins:           exitDurationMins,
+					startupStallTimeoutSeconds: startupStallTimeoutSeconds,
+					gpusPerNode:                gpusPerNode,
+					storageClass:               storageClass,
+					repeatCount:                repeatCount,
+					maxRestarts:                maxRestarts,
 				}
 				if cmd.Flags().Changed("enable-checkpoint") {
 					opts.enableCheckpoint = &enableCheckpoint
@@ -736,6 +871,8 @@ Use --cleanup to teardown installed components after completion.`,
 		"Max training steps for NeMo 4 workloads (0 = use catalog default)")
 	cmd.Flags().Int32Var(&exitDurationMins, "exit-duration-mins", 0,
 		"Training duration in minutes for NeMo 6 workloads (0 = use catalog default)")
+	cmd.Flags().Int32Var(&startupStallTimeoutSeconds, "startup-stall-timeout-seconds", 0,
+		"Startup-stall window in seconds for training workloads (0 = use catalog default)")
 	cmd.Flags().Int32Var(&gpusPerNode, "gpus-per-node", 0,
 		"GPUs per node (0 = auto-detect from GPU architecture)")
 	cmd.Flags().BoolVar(&enableMNNVL, "enable-mnnvl", false,
@@ -747,7 +884,7 @@ Use --cleanup to teardown installed components after completion.`,
 	cmd.Flags().StringVar(&storageClass, "storage-class", "",
 		"StorageClass for PVC dependencies created by catalog entries")
 	cmd.Flags().DurationVar(&timeout, "timeout", 30*time.Minute,
-		"Timeout for --wait (when not set, derived from the selected categories' timeoutPerJob budgets, floored at 30m; on timeout, print a partial report and leave the certification running unless --cleanup is set)")
+		"Timeout for --wait; ignored without --wait; must be at least 1s when --wait is set (when not set, derived from the selected categories' timeoutPerJob budgets, floored at 30m; on timeout, print a partial report and leave the certification running unless --cleanup is set)")
 	cmd.Flags().StringVar(&resultsFile, "results-file", "",
 		"Write certification report as JSON to this file path (requires --wait)")
 	configFlags.AddFlags(cmd.Flags())
@@ -836,7 +973,6 @@ func buildConfigFromFlags(
 	if err != nil {
 		return nil, err
 	}
-
 	if name == "" {
 		name = generateCertName()
 	}
@@ -892,6 +1028,9 @@ func buildConfigFromFlags(
 	}
 	if opts.exitDurationMins > 0 {
 		cert.Spec.ExitDurationMins = &opts.exitDurationMins
+	}
+	if opts.startupStallTimeoutSeconds > 0 {
+		cert.Spec.StartupStallTimeoutSeconds = &opts.startupStallTimeoutSeconds
 	}
 	if opts.gpusPerNode > 0 {
 		cert.Spec.GpusPerNode = &opts.gpusPerNode

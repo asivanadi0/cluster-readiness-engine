@@ -18,11 +18,14 @@ kind: ServiceMonitor
 metadata:
   name: nvcre-metrics-monitor
   namespace: nvcre
+  labels:
+    release: prometheus
 spec:
   endpoints:
     - path: /metrics
       port: https
       scheme: https
+      honorLabels: true
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
         insecureSkipVerify: true  # Use cert-manager in production
@@ -31,13 +34,21 @@ spec:
       control-plane: manager
 ```
 
-## Job status metrics
+`honorLabels: true` (chart default `metrics.serviceMonitor.honorLabels`) keeps the controller's own `namespace` and `job` labels on each series. Without it, Prometheus prefers scrape-target labels and renames the metric labels to `exported_namespace` / `exported_job`, so the PromQL examples below would match the controller Service rather than the Certification Job. Clusters that already built dashboards on `exported_*` can set `metrics.serviceMonitor.honorLabels=false`.
+
+Tune scrape cadence with `metrics.serviceMonitor.interval` and `metrics.serviceMonitor.scrapeTimeout` (empty uses the Prometheus defaults). kube-prometheus-stack users should set `metrics.serviceMonitor.labels.release` to their Prometheus Helm release name (default `prometheus`). See `helm/cluster-readiness-engine/values.yaml` for the full set of knobs.
+
+## Lifecycle status metrics
+
+Certification, Workflow and Job conditions are the operator-facing source of truth (`kubectl get certifications,workflows,jobs.nvcre.nvidia.com`). These gauges export them so a status panel or alert can show the verdict of a run.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nvcre_job_status` | Gauge | `namespace`, `job`, `workflow`, `status` | Current status of burn-in Jobs. Value is `1` for the current status, `0` for others. Status values: `in_progress`, `succeeded`, `failed`. |
+| `nvcre_certification_status` | Gauge | `namespace`, `certification`, `status` | Current status of Certifications. Value is `1` for the current status, `0` for others. Status values: `in_progress`, `succeeded`, `failed` (mapped from the InProgress / Succeeded / Failed condition types). |
+| `nvcre_workflow_status` | Gauge | `namespace`, `workflow`, `certification`, `status` | Current status of Workflows. Value is `1` for the current status, `0` for others. Same status values as Certification. `certification` is the value of the Workflow's `nvcre.nvidia.com/certification` label, or empty when that label is absent. |
+| `nvcre_job_status` | Gauge | `namespace`, `job`, `workflow`, `status` | Current status of burn-in Jobs. Value is `1` for the current status, `0` for others. Same status values as Certification. `workflow` is the value of the Job's `nvcre.nvidia.com/workflow` label, or empty when that label is absent. |
 
-The gauge is set for all three status values on each update, ensuring that a transition from `in_progress` to `succeeded` also zeroes out the `in_progress` series. Metrics are cleaned up when a Job is deleted.
+These series are built at scrape time from the elected leader's informer cache. Each scrape lists Certifications, Workflows and Jobs and emits `1` for the true InProgress / Succeeded / Failed condition and `0` for the peers, so a status written by any reconciler, including a Workflow's `timeoutPerJob` write on its Job, shows on the next scrape, and the series are correct again after a controller restart. If more than one phase condition is `True`, `failed` wins, then `succeeded`, then `in_progress`. An object with no phase condition `True` is omitted. An object being deleted keeps its series until it leaves the cache, and they disappear on the next scrape after that; a changed parent label reports the new value and does not leave old series. Standby replicas emit nothing. Reason strings are not exported as labels.
 
 ## Hardware failure metrics
 
@@ -99,18 +110,20 @@ Goodput metrics are cleaned up at specific lifecycle events to prevent stale dat
 
 ## NCCL bandwidth metrics
 
-All NCCL bandwidth metrics share the same label set: `namespace`, `measurement`, `job`, `workflow`, `nccl_test`, `message_size_bytes`.
+All NCCL bandwidth metrics share the same label set: `namespace`, `measurement`, `job`, `workflow`, `nccl_test`, `message_size_bytes`. Values are **gigabytes per second** (the nccl-tests `algbw` / `busbw` columns), not gigabits.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `nvcre_nccl_algbw_gbps` | Gauge | NCCL algorithmic bandwidth in GB/s per message size |
-| `nvcre_nccl_busbw_gbps` | Gauge | NCCL bus bandwidth in GB/s per message size |
+| `nvcre_nccl_algbw_gbs` | Gauge | NCCL algorithmic bandwidth in GB/s per message size |
+| `nvcre_nccl_busbw_gbs` | Gauge | NCCL bus bandwidth in GB/s per message size |
+| `nvcre_nccl_algbw_gbps` | Gauge | **Deprecated.** Alias of `nvcre_nccl_algbw_gbs`. Dual-registered for one minor release; the `_gbps` suffix incorrectly implied gigabits. |
+| `nvcre_nccl_busbw_gbps` | Gauge | **Deprecated.** Alias of `nvcre_nccl_busbw_gbs`. Dual-registered for one minor release; the `_gbps` suffix incorrectly implied gigabits. |
 
 The `nccl_test` label identifies the collective operation (e.g., `all_reduce`, `all_gather`, `alltoall`). The `message_size_bytes` label tracks results per message size tested.
 
 NCCL bandwidth metrics are cleaned up when a BandwidthMeasurement is deleted.
 
-**Cardinality at scale:** NCCL metrics include a `message_size_bytes` label (typically 20-30 values per test). With 3 test types and 10 concurrent measurements, expect ~600-900 NCCL time series. Goodput metrics produce 10 series per measurement. At 100+ concurrent Jobs, monitor your Prometheus memory and consider increasing `sampleInterval` or limiting concurrent Certifications.
+**Cardinality at scale:** NCCL metrics include a `message_size_bytes` label (typically 20-30 values per test). With 3 test types and 10 concurrent measurements, expect ~600-900 NCCL time series from the canonical `_gbs` names. During the deprecation window the `_gbps` aliases are dual-registered, which doubles that count. Goodput metrics produce 10 series per measurement. At 100+ concurrent Jobs, monitor your Prometheus memory and consider increasing `sampleInterval` or limiting concurrent Certifications.
 
 ## Topology metrics
 
@@ -120,6 +133,27 @@ NCCL bandwidth metrics are cleaned up when a BandwidthMeasurement is deleted.
 | `nvcre_topology_failed_nodes` | Gauge | `namespace`, `workflow`, `topology_key`, `domain`, `node` | Set to `1` for each node that failed burn-in validation. Useful for identifying bad switches, racks, or NVLink cliques from Prometheus. |
 
 ## Example PromQL queries
+
+With the chart default `honorLabels: true`, filters on `namespace` and `job` refer to the Certification Job as documented in the tables above. If you scrape without honoring metric labels, those label names refer to the scrape target instead.
+
+### Certification and Workflow status
+
+```promql
+# Certifications that have failed
+nvcre_certification_status{status="failed"} == 1
+
+# Currently running Certifications
+nvcre_certification_status{status="in_progress"} == 1
+
+# Certification status breakdown per namespace
+sum by (namespace, status) (nvcre_certification_status == 1)
+
+# Failed Workflows, grouped by nvcre.nvidia.com/certification
+nvcre_workflow_status{status="failed"} == 1
+
+# Workflows still in progress for a Certification
+nvcre_workflow_status{status="in_progress", certification="gpu-cluster-cert"} == 1
+```
 
 ### Job status
 
@@ -167,14 +201,16 @@ avg(nvcre_goodput_avg_tflops_per_gpu) by (namespace)
 
 ```promql
 # Bus bandwidth for all_reduce across all message sizes
-nvcre_nccl_busbw_gbps{nccl_test="all_reduce"}
+nvcre_nccl_busbw_gbs{nccl_test="all_reduce"}
 
 # Average algorithmic bandwidth per test type
-avg(nvcre_nccl_algbw_gbps) by (nccl_test)
+avg(nvcre_nccl_algbw_gbs) by (nccl_test)
 
 # Compare bandwidth across message sizes for a specific measurement
-nvcre_nccl_algbw_gbps{measurement="nccl-allreduce-bw"}
+nvcre_nccl_algbw_gbs{measurement="nccl-allreduce-bw"}
 ```
+
+The `_gbps` names remain as deprecated aliases for one minor release. New dashboards should query `_gbs`.
 
 ### Reconciliation performance
 
@@ -243,6 +279,20 @@ spec:
               below the 75% threshold. Check for frequent checkpointing
               or rescheduling overhead.
 
+        # Alert when a Certification has failed
+        - alert: NVCRECertificationFailed
+          expr: |
+            nvcre_certification_status{status="failed"} == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "NVCRE Certification {{ $labels.certification }} failed"
+            description: >
+              Certification {{ $labels.certification }} in namespace
+              {{ $labels.namespace }} is Failed. Inspect category status
+              and Workflow conditions for the failing domain/variant.
+
         # Alert when a job appears stuck (in_progress for too long)
         - alert: NVCREJobStuck
           expr: |
@@ -263,7 +313,8 @@ spec:
 
 ## See also
 
+- [Certification API](../api-reference/certification.md) — the resource that emits certification status metrics
 - [Job API](../api-reference/job.md) — the resource that emits job status and hardware failure metrics
 - [GoodputMeasurement API](../api-reference/goodput-measurement.md) and [BandwidthMeasurement API](../api-reference/bandwidth-measurement.md) — the resources that populate goodput and bandwidth metrics
-- [Workflow API](../api-reference/workflow.md) — the resource that populates topology validation metrics
+- [Workflow API](../api-reference/workflow.md) — the resource that emits workflow status and topology validation metrics
 - [Goodput & Bandwidth Measurement](../concepts/goodput-bandwidth.md) — conceptual overview of the goodput formula and its components

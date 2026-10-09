@@ -4,6 +4,7 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -114,6 +115,7 @@ func (r *CertificationReconciler) workflowReader() client.Reader {
 // +kubebuilder:rbac:groups=nvcre.nvidia.com,resources=workflows,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=nvcre.nvidia.com,resources=workflows/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -477,7 +479,7 @@ func (r *CertificationReconciler) createWorkflowForCategory(ctx context.Context,
 	// Cordoned nodes are discarded here. The Workflow runs the same discovery and
 	// records them on its own status, which is where the report reads coverage
 	// from, so recording them twice would only risk the two disagreeing.
-	nodes, _, err := discoverTargetNodes(ctx, r.Client, &certification.Spec.Target)
+	nodes, _, _, err := discoverTargetNodes(ctx, r.Client, r.APIReader, &certification.Spec.Target)
 	if err != nil {
 		return "", fmt.Errorf("discovering target nodes: %w", err)
 	}
@@ -534,11 +536,27 @@ func (r *CertificationReconciler) createWorkflowForCategory(ctx context.Context,
 		r.normalf(certification, ReasonNICResourceDetection,
 			"%s/%s: %s", category.Domain, category.Variant, nicDetectionMessage(nicDetected))
 	}
-
 	capableNodes, err := dropUnderCapacityNodes(archNodes, category, gpusPerNode)
 	if err != nil {
 		return "", err
 	}
+
+	// The GCP H100 TCPXO patch attaches the pod to the node's GPU NIC networks
+	// by name, and the provisioner chose those names, so they are detected from
+	// the nodes the job can run on: the capable set nodesPerJob is sized from,
+	// which the Workflow filters to again. An under-capacity node never runs
+	// the job, so its networks must not force the fallback. When detection
+	// refuses, the catalog default is rendered, and a Warning says why once
+	// the Workflow is created.
+	gkeNetworks := resolveGKETCPXONetworks(detectedPlatform, gpuArch, capableNodes)
+
+	// The GCP H100 workload images and the tcpxo-daemon image follow the
+	// TCPXO plugin release GKE installed, read from the installer pods on the
+	// same capable nodes, since node pools can run different releases. A
+	// cached read that finds no release is confirmed live through APIReader.
+	// When no mapped release results, the nearest safe profile is rendered,
+	// and a Warning says why once the Workflow is created.
+	tcpxoPlugin := resolveTCPXOPluginVersion(ctx, r.Client, r.APIReader, detectedPlatform, gpuArch, capableNodes)
 
 	nodesPerJob, err := resolveNodesPerJob(capableNodes, category, opts, entry, gpusPerNode, gpuArch)
 	if err != nil {
@@ -552,34 +570,37 @@ func (r *CertificationReconciler) createWorkflowForCategory(ctx context.Context,
 
 	// --- 3. Render templates (entry.Build) ---
 	workflowSpec, buildErr := entry.Build(certification.Spec.Target, catalog.BuildConfig{
-		ImagePullSecrets:   opts.ImagePullSecrets,
-		StorageClassName:   opts.StorageClassName,
-		NodesPerJob:        nodesPerJob,
-		GpusPerNode:        gpusPerNode,
-		MlnxPerNode:        mlnxPerNode,
-		NicResourceName:    nicResourceName,
-		Resources:          opts.Resources,
-		EnableMNNVL:        enableMNNVL,
-		EnableCheckpoint:   derefBool(opts.EnableCheckpoint),
-		MaxSteps:           derefInt32(opts.MaxSteps),
-		ExitDurationMins:   derefInt32(opts.ExitDurationMins),
-		GPUArchitecture:    gpuArch,
-		SaveInterval:       derefInt32(opts.SaveInterval),
-		SaveRetainInterval: derefInt32(opts.SaveRetainInterval),
-		SaveTopK:           derefInt32(opts.SaveTopK),
-		StorageSize:        opts.StorageSize,
-		TestScale:          opts.TestScale,
-		MaxBytes:           opts.MaxBytes,
-		NumIterations:      derefInt32(opts.NumIterations),
-		NumCycles:          derefInt32(opts.NumCycles),
-		Thresholds:         opts.Thresholds,
-		MaxConcurrent:      derefInt32(opts.MaxConcurrent),
-		MinGroupSize:       derefInt32(opts.MinGroupSize),
-		RepeatCount:        derefInt32(opts.RepeatCount),
-		MaxRestarts:        derefInt32(opts.MaxRestarts),
-		TimeoutPerJob:      opts.TimeoutPerJob,
-		MeasurementTimeout: opts.MeasurementTimeout,
-		SourceRepo:         opts.SourceRepo,
+		ImagePullSecrets:           opts.ImagePullSecrets,
+		StorageClassName:           opts.StorageClassName,
+		NodesPerJob:                nodesPerJob,
+		GpusPerNode:                gpusPerNode,
+		MlnxPerNode:                mlnxPerNode,
+		NicResourceName:            nicResourceName,
+		GKETCPXONetworks:           gkeNetworks.Names,
+		TCPXOPluginVersion:         tcpxoPlugin.Version,
+		Resources:                  opts.Resources,
+		EnableMNNVL:                enableMNNVL,
+		EnableCheckpoint:           derefBool(opts.EnableCheckpoint),
+		MaxSteps:                   derefInt32(opts.MaxSteps),
+		ExitDurationMins:           derefInt32(opts.ExitDurationMins),
+		StartupStallTimeoutSeconds: derefInt32(opts.StartupStallTimeoutSeconds),
+		GPUArchitecture:            gpuArch,
+		SaveInterval:               derefInt32(opts.SaveInterval),
+		SaveRetainInterval:         derefInt32(opts.SaveRetainInterval),
+		SaveTopK:                   derefInt32(opts.SaveTopK),
+		StorageSize:                opts.StorageSize,
+		TestScale:                  opts.TestScale,
+		MaxBytes:                   opts.MaxBytes,
+		NumIterations:              derefInt32(opts.NumIterations),
+		NumCycles:                  derefInt32(opts.NumCycles),
+		Thresholds:                 opts.Thresholds,
+		MaxConcurrent:              derefInt32(opts.MaxConcurrent),
+		MinGroupSize:               derefInt32(opts.MinGroupSize),
+		RepeatCount:                derefInt32(opts.RepeatCount),
+		MaxRestarts:                derefInt32(opts.MaxRestarts),
+		TimeoutPerJob:              opts.TimeoutPerJob,
+		MeasurementTimeout:         opts.MeasurementTimeout,
+		SourceRepo:                 opts.SourceRepo,
 	})
 	if buildErr != nil {
 		return "", fmt.Errorf("building workflow for %s/%s: %w", category.Domain, category.Variant, buildErr)
@@ -699,9 +720,30 @@ func (r *CertificationReconciler) createWorkflowForCategory(ctx context.Context,
 			}
 			return "", &workflowCreateRejectedError{err: errors.Join(createErr, statusErr)}
 		}
+	} else {
+		// Only the reconcile whose Create succeeded warns, so a retry that finds
+		// the Workflow already there does not repeat it.
+		r.warnGCPH100DetectionFallbacks(certification, gkeNetworks, tcpxoPlugin)
 	}
 
 	return workflowName, nil
+}
+
+// warnGCPH100DetectionFallbacks emits one Warning per GCP H100 detection that
+// ran without an exact result, so a fallback was rendered in its place. The
+// messages carry no category: the result is the same for every category, so
+// every category emits the same text. The Certification's resourceVersion
+// advances between categories, so each emission lands as its own event
+// rather than incrementing a series.
+func (r *CertificationReconciler) warnGCPH100DetectionFallbacks(
+	certification *nvcrev1alpha1.Certification, gkeNetworks gkeNetworkDetection, tcpxoPlugin tcpxoPluginDetection,
+) {
+	if gkeNetworks.Ran && len(gkeNetworks.Names) == 0 {
+		r.warnf(certification, ReasonGKENetworkDetection, "%s", gkeNetworkDetectionMessage(gkeNetworks))
+	}
+	if tcpxoPlugin.Ran && !tcpxoPlugin.Exact {
+		r.warnf(certification, ReasonTCPXOPluginDetection, "%s", tcpxoPluginDetectionMessage(tcpxoPlugin))
+	}
 }
 
 // retryableCreateError marks a createWorkflowForCategory failure that a later
@@ -754,6 +796,8 @@ func ResolveOptions(global *nvcrev1alpha1.CategoryOptions, override *nvcrev1alph
 	if override.ExitDurationMins != nil {
 		resolved.ExitDurationMins = override.ExitDurationMins
 	}
+	// A non-nil override wins, including a pointer to zero.
+	resolved.StartupStallTimeoutSeconds = cmp.Or(override.StartupStallTimeoutSeconds, resolved.StartupStallTimeoutSeconds)
 	if override.GpusPerNode != nil {
 		resolved.GpusPerNode = override.GpusPerNode
 	}
@@ -769,9 +813,17 @@ func ResolveOptions(global *nvcrev1alpha1.CategoryOptions, override *nvcrev1alph
 	if override.EnableMNNVL != nil {
 		resolved.EnableMNNVL = override.EnableMNNVL
 	}
-	if override.Image != "" {
-		resolved.Image = override.Image
-	}
+	// String options take the override whenever it is non-empty. Written with
+	// cmp.Or rather than a branch each: there are seven of them, they are
+	// mutually independent, and spelled as ifs they were most of this
+	// function's cyclomatic complexity for no reader benefit.
+	resolved.Image = cmp.Or(override.Image, resolved.Image)
+	resolved.StorageSize = cmp.Or(override.StorageSize, resolved.StorageSize)
+	resolved.TestScale = cmp.Or(override.TestScale, resolved.TestScale)
+	resolved.MaxBytes = cmp.Or(override.MaxBytes, resolved.MaxBytes)
+	resolved.TimeoutPerJob = cmp.Or(override.TimeoutPerJob, resolved.TimeoutPerJob)
+	resolved.MeasurementTimeout = cmp.Or(override.MeasurementTimeout, resolved.MeasurementTimeout)
+	resolved.SourceRepo = cmp.Or(override.SourceRepo, resolved.SourceRepo)
 	if len(override.ImagePullSecrets) > 0 {
 		resolved.ImagePullSecrets = override.ImagePullSecrets
 	}
@@ -786,15 +838,6 @@ func ResolveOptions(global *nvcrev1alpha1.CategoryOptions, override *nvcrev1alph
 	}
 	if override.SaveTopK != nil {
 		resolved.SaveTopK = override.SaveTopK
-	}
-	if override.StorageSize != "" {
-		resolved.StorageSize = override.StorageSize
-	}
-	if override.TestScale != "" {
-		resolved.TestScale = override.TestScale
-	}
-	if override.MaxBytes != "" {
-		resolved.MaxBytes = override.MaxBytes
 	}
 	if override.NumIterations != nil {
 		resolved.NumIterations = override.NumIterations
@@ -816,15 +859,6 @@ func ResolveOptions(global *nvcrev1alpha1.CategoryOptions, override *nvcrev1alph
 	}
 	if override.MaxRestarts != nil {
 		resolved.MaxRestarts = override.MaxRestarts
-	}
-	if override.TimeoutPerJob != "" {
-		resolved.TimeoutPerJob = override.TimeoutPerJob
-	}
-	if override.MeasurementTimeout != "" {
-		resolved.MeasurementTimeout = override.MeasurementTimeout
-	}
-	if override.SourceRepo != "" {
-		resolved.SourceRepo = override.SourceRepo
 	}
 	return resolved
 }
@@ -890,10 +924,19 @@ func dropUnderCapacityNodes(nodes []corev1.Node, cat nvcrev1alpha1.CertificateCa
 }
 
 // resolveNodesPerJob determines the nodesPerJob for a category.
-// When explicitly set, clamps to the largest valid node count <= min(requested, available).
-// Otherwise auto-selects the largest valid node count <= available nodes.
-// "Valid" means satisfying the entry's constraints (minGPUs, TP×PP divisibility).
-// When no constraints are defined, uses all available nodes.
+//
+// The number is a group size for a sweep that covers the whole target, so the
+// controller is free to pick it: when explicitly set it clamps to the largest
+// valid node count <= min(requested, available), and otherwise auto-selects the
+// largest valid count <= available nodes. "Valid" means satisfying the entry's
+// constraints (minGPUs, TP×PP divisibility). When no constraints are defined,
+// it uses all available nodes.
+//
+// The adjustments are safe here precisely because a Certification covers every
+// targeted node either way: a clamp or a snap changes how the sweep is cut into
+// jobs, not which nodes it reaches. A WorkloadRun with placement Unpinned makes
+// the opposite promise, which is why that mode lives there and not here. See
+// ADR-089.
 func resolveNodesPerJob(nodes []corev1.Node, cat nvcrev1alpha1.CertificateCategory, opts nvcrev1alpha1.CategoryOptions, entry *catalog.Entry, gpusPerNode int32, gpuArch string) (int32, error) {
 	n := int32(len(nodes))
 	if n == 0 {

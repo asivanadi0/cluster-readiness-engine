@@ -86,6 +86,10 @@ Key chart values:
 | `pdb.minAvailable` | `1` | Minimum ready controller pods during voluntary eviction; integer or percentage |
 | `metrics.port` | `8443` | Controller metrics port |
 | `metrics.serviceMonitor.enabled` | `true` | Install a `ServiceMonitor` (requires the Prometheus Operator CRDs; set to `false` on clusters without them) |
+| `metrics.serviceMonitor.honorLabels` | `true` | Keep the controller's `namespace`/`job` labels instead of overwriting them with scrape-target labels |
+| `metrics.serviceMonitor.labels` | `{release: prometheus}` | Extra ServiceMonitor labels for Prometheus Operator discovery. Override `release` to match your kube-prometheus-stack Helm release name |
+| `metrics.serviceMonitor.interval` | `""` | Optional scrape interval; empty uses the Prometheus default |
+| `metrics.serviceMonitor.scrapeTimeout` | `""` | Optional scrape timeout; empty uses the Prometheus default |
 
 ### Restricted egress and air-gapped installs
 
@@ -121,6 +125,29 @@ For a controller image mirrored off GHCR, omit `--image-pull-secret`: both its t
   ```
 
   Installing the chart with Helm directly carries the same caveats as bypassing `setup init` below: install Kubeflow Trainer yourself, and re-apply the CRDs on upgrades.
+
+**When no registry is reachable at all.** The mirroring and credential paths above assume the cluster can reach *some* registry. A detached segment may have none, in which case preload the images into each node's container runtime instead of pulling them:
+
+1. Produce or export the image somewhere that has egress — a workstation, or a build Job inside a cluster that has network access.
+2. Serve the exported tar from a pod on the nodes' own network, or copy it to the nodes directly. A pod with `hostNetwork: true` running an HTTP server over the tar is the least invasive option, because the nodes can reach a node IP without any registry or service in between.
+3. Import it on every node that may run the workload:
+
+   ```bash
+   curl -fsS http://<node-ip>:<port>/image.tar | ctr -n k8s.io images import -
+   ```
+
+   The pipeline streams the whole tar to each node, but containerd only stores layers it does not already have, so a derived
+   image costs little extra disk on a node that already carries its base.
+
+4. Reference the preloaded image by an **explicitly tagged** reference — never `:latest`, because `:latest` (and an omitted tag)
+   defaults to `Always`, which sends the kubelet to a registry that this cluster cannot reach; any other tag defaults to
+   `IfNotPresent` and stays on the local copy. Name it in whichever path owns the reference: the controller chart's
+   `manager.image.repository`/`manager.image.tag` (or `manager.image.digest` for a digest-pinned image), a Certification's
+   `spec.image` or `categories[].options.image`, or a WorkloadRun's `spec.image`. These paths choose the image, not a pull
+   policy: the chart leaves the manager container's `imagePullPolicy` unset, and Certification and WorkloadRun expose no
+   workload pull-policy field. The API server defaults the omitted policy according to the tag as described above.
+
+This is also the only path that works for an air-gapped workload image derived from a base image the nodes already have — for example the `sshd`-prebaked MPI image recommended in the [FAQ](faq.md#can-mpi-workloads-run-in-air-gapped-or-restricted-egress-clusters).
 
 **Bypass `setup init`.** Install the in-repo chart (`helm/cluster-readiness-engine` in the source tree) directly with `helm install`, setting `manager.image.repository` and `manager.image.tag` to your mirrored image (and `manager.imagePullSecrets` when the mirror needs credentials), and install Kubeflow Trainer manually. Nothing is pulled from a chart registry, but you take on installing the Kubeflow Trainer version this release supports and re-applying the CRDs on upgrades yourself.
 
@@ -220,6 +247,7 @@ The controller's ClusterRole (`nvcre-manager-role`) is scoped to the resource ty
 | `persistentvolumes` | get, list, patch, watch | Checkpoint storage handling |
 | `events` | create, patch | Emit Kubernetes events |
 | `resource.k8s.io` ResourceClaimTemplates | create, delete, get, list, patch, update | RoCE/DRA network resources |
+| `resource.k8s.io` ResourceSlices | get, list, watch | GPU architecture fallback on DRA-only GPU stacks with no `nvidia.com/gpu.product` label |
 | `resource.nvidia.com` ComputeDomains | create, delete, get, list, patch, update | Multi-Node NVLink (MNNVL) domains |
 | `trainer.kubeflow.org` TrainingRuntimes, TrainJobs | create, delete, get, list, patch, update (TrainJobs also watch; `trainjobs/status` get) | Training workloads via Kubeflow Trainer |
 
@@ -300,7 +328,7 @@ The `training/nemotron5-8b` and `training/nemotron5-56b` categories run a `megat
    RUN git clone --depth 1 -b core_v0.15.2 https://github.com/NVIDIA/Megatron-LM.git /opt/megatron-lm
    ```
 
-   That exact line keeps the branch pin identical to the one the init container would clone and leaves `.git` present for anything that expects a git checkout. The init container copies the tree into the workspace on every fresh pod start, so the source travels with the image and is covered by the ordinary workload-image pre-loading described at the top of this section; no git egress happens at runtime. The entries have no image knob, so serve the extended image under the same `nvcr.io/nvidia/pytorch:25.08-py3` reference they use: pre-load it on the nodes or publish it through your registry mirror under that name.
+   That exact line keeps the branch pin identical to the one the init container would clone and leaves `.git` present for anything that expects a git checkout. The init container copies the tree into the workspace on every fresh pod start, so the source travels with the image and is covered by the ordinary workload-image pre-loading described at the top of this section; no git egress happens at runtime. Then either point the categories at the extended image with `categories[].options.image`, which also replaces the `megatron-clone` init container's image, or serve it under the reference the entries render on your platform: pre-load it on the nodes or publish it through your registry mirror under that name. That reference is `nvcr.io/nvidia/pytorch:25.08-py3` everywhere except GCP H100, where the training image follows the TCPXO plugin version detected on the nodes (`pytorch:25.06-py3` for plugin v1.0.15 and v1.0.16, and when detection finds no release); see [GCP H100 clusters](../concepts/platform-detection.md#gcp-h100-clusters). `nvcrectl certification render --dry-run` prints the reference it picked.
 
 2. **Pre-seed the workspace PVC.** Set `enableCheckpoint: true` (plus `storageClassName` if the cluster has no default StorageClass). The category then mounts a PersistentVolumeClaim named `<variant>-pvc` (for example `nemotron5-8b-pvc`) at `/mnt/workspace` instead of a memory-backed `emptyDir`. Pre-populate that volume with the Megatron-LM source at `megatron-lm/` before creating the Certification: the init container uses the workspace unchanged whenever `/mnt/workspace/megatron-lm` exists (a plain source export works; `.git` is not required). Without `enableCheckpoint` the workspace is an `emptyDir`, so this option does not apply and the source is resolved from the image or the network on every pod start.
 

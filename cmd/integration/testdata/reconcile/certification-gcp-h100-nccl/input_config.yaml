@@ -14,3 +14,14 @@ collect:
   - kind: Workflow
     name: gcp-nc-h1-communication-n-be79a
     namespace: default
+events:
+  # The nodes advertise no GKE networks, so detection falls back to the
+  # catalog's gpu-nic0..gpu-nic7 and says so with a Warning (issue #432).
+  # No nccl-tcpxo-installer pod runs on them either, so plugin version
+  # detection falls back to the CUDA 12 images and warns too (issue #438).
+  - involvedKind: Certification
+    involvedName: gcp-nc-h1
+    namespace: default
+    expect:
+      - {type: Warning, reason: GKENetworkDetection}
+      - {type: Warning, reason: TCPXOPluginDetection}

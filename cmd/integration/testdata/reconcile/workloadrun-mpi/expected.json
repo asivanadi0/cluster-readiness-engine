@@ -36,11 +36,49 @@
               "trainer": {
                 "image": "nvcr.io/nvidia/pytorch:26.01-py3",
                 "command": [
-                  "/bin/bash",
-                  "-c"
+                  "timeout",
+                  "3600",
+                  "/usr/local/mpi/bin/mpirun"
                 ],
                 "args": [
-                  "rm -rf /opt/amazon\nunset NCCL_NET_PLUGIN\nunset NCCL_TUNER_PLUGIN\nunset AWS_OFI_NCCL_VERSION\nexec \"timeout\" \"3600\" \"/usr/local/mpi/bin/mpirun\" \"-N\" \"4\" \"--allow-run-as-root\" \"--mca\" \"plm_rsh_args\" \"-o StrictHostKeyChecking=no -o ConnectionAttempts=10\" \"-x\" \"NCCL_DEBUG=INFO\" \"-x\" \"NCCL_MNNVL_ENABLE=1\" \"-x\" \"NCCL_NET_PLUGIN=none\" \"--allow-run-as-root\" \"/usr/local/bin/all_reduce_perf_mpi\" \"-b\" \"8\" \"-e\" \"32G\" \"-f\" \"2\""
+                  "-N",
+                  "4",
+                  "--allow-run-as-root",
+                  "--mca",
+                  "plm_rsh_args",
+                  "-o StrictHostKeyChecking=no -o ConnectionAttempts=10",
+                  "-x",
+                  "NCCL_DEBUG=INFO",
+                  "-x",
+                  "NCCL_NVLS_ENABLE=1",
+                  "-x",
+                  "NCCL_CUMEM_ENABLE=1",
+                  "-x",
+                  "NCCL_NET_GDR_C2C=1",
+                  "-x",
+                  "NCCL_NET_GDR_LEVEL=PHB",
+                  "-x",
+                  "NCCL_P2P_NET_CHUNKSIZE=2097152",
+                  "-x",
+                  "NCCL_SHM_DISABLE=1",
+                  "-x",
+                  "NCCL_MNNVL_ENABLE=1",
+                  "-x",
+                  "NCCL_SOCKET_IFNAME=eth0",
+                  "-x",
+                  "FI_PROVIDER=efa",
+                  "-x",
+                  "FI_EFA_USE_DEVICE_RDMA=1",
+                  "-x",
+                  "FI_EFA_FORK_SAFE=1",
+                  "--allow-run-as-root",
+                  "/usr/local/bin/all_reduce_perf_mpi",
+                  "-b",
+                  "8",
+                  "-e",
+                  "32G",
+                  "-f",
+                  "2"
                 ],
                 "numNodes": 2,
                 "numProcPerNode": 4
@@ -131,10 +169,6 @@
                                   {
                                     "name": "NCCL_DEBUG",
                                     "value": "INFO"
-                                  },
-                                  {
-                                    "name": "NCCL_DEBUG_SUBSYS",
-                                    "value": "NET,INIT"
                                   },
                                   {
                                     "name": "NCCL_NVLS_ENABLE",
@@ -242,10 +276,6 @@
                                   {
                                     "name": "NCCL_DEBUG",
                                     "value": "INFO"
-                                  },
-                                  {
-                                    "name": "NCCL_DEBUG_SUBSYS",
-                                    "value": "NET,INIT"
                                   },
                                   {
                                     "name": "NCCL_NVLS_ENABLE",
@@ -481,6 +511,9 @@
         },
         {
           "when": {
+            "gpuArchitecture": {
+              "equals": "gb300"
+            },
             "platform": {
               "equals": "aws"
             }
@@ -488,6 +521,9 @@
         },
         {
           "when": {
+            "gpuArchitecture": {
+              "equals": "gb300"
+            },
             "platform": {
               "equals": "aws"
             }
@@ -539,6 +575,13 @@
                                       "requests": {
                                         "vpc.amazonaws.com/efa": 4
                                       }
+                                    },
+                                    "securityContext": {
+                                      "capabilities": {
+                                        "add": [
+                                          "IPC_LOCK"
+                                        ]
+                                      }
                                     }
                                   }
                                 ]
@@ -553,6 +596,16 @@
               }
             }
           ]
+        },
+        {
+          "when": {
+            "gpuArchitecture": {
+              "equals": "gb200"
+            },
+            "platform": {
+              "equals": "aws"
+            }
+          }
         },
         {
           "when": {
@@ -678,6 +731,13 @@
                                       "requests": {
                                         "vpc.amazonaws.com/efa": 32
                                       }
+                                    },
+                                    "securityContext": {
+                                      "capabilities": {
+                                        "add": [
+                                          "IPC_LOCK"
+                                        ]
+                                      }
                                     }
                                   }
                                 ]
@@ -692,6 +752,16 @@
               }
             }
           ]
+        },
+        {
+          "when": {
+            "gpuArchitecture": {
+              "equals": "h100"
+            },
+            "platform": {
+              "equals": "aws"
+            }
+          }
         },
         {
           "when": {
@@ -737,12 +807,12 @@
                         "value": "0"
                       },
                       {
-                        "name": "NCCL_ALGO",
-                        "value": "Ring,Tree"
+                        "name": "NCCL_PROTO",
+                        "value": "Simple,LL128"
                       },
                       {
-                        "name": "NCCL_PROTO",
-                        "value": "Simple"
+                        "name": "NCCL_NVLSTREE_MAX_CHUNKSIZE",
+                        "value": "131072"
                       },
                       {
                         "name": "NCCL_MIN_NCHANNELS",
@@ -1221,6 +1291,201 @@
               }
             }
           ]
+        },
+        {
+          "when": {
+            "gpuArchitecture": {
+              "equals": "rtxpro6000"
+            },
+            "platform": {
+              "equals": "gcp"
+            }
+          },
+          "dependencies": [
+            {
+              "apiVersion": "trainer.kubeflow.org/v1alpha1",
+              "kind": "TrainingRuntime",
+              "metadata": {
+                "name": "test-mpi-run-runtime"
+              },
+              "spec": {
+                "template": {
+                  "spec": {
+                    "replicatedJobs": [
+                      {
+                        "name": "node",
+                        "template": {
+                          "spec": {
+                            "template": {
+                              "spec": {
+                                "tolerations": [
+                                  {
+                                    "effect": "NoSchedule",
+                                    "key": "nvidia.com/gpu",
+                                    "operator": "Equal",
+                                    "value": "present"
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "when": {
+            "gpuArchitecture": {
+              "in": [
+                "b200",
+                "gb300"
+              ]
+            },
+            "platform": {
+              "equals": "nscale"
+            }
+          },
+          "dependencies": [
+            {
+              "apiVersion": "resource.k8s.io/v1",
+              "kind": "ResourceClaimTemplate",
+              "metadata": {
+                "labels": {
+                  "app": "test-mpi-run"
+                },
+                "name": "test-mpi-run-gpu"
+              },
+              "spec": {
+                "spec": {
+                  "devices": {
+                    "requests": [
+                      {
+                        "exactly": {
+                          "count": 4,
+                          "deviceClassName": "gpu.nvidia.com"
+                        },
+                        "name": "gpu"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "apiVersion": "resource.k8s.io/v1",
+              "kind": "ResourceClaimTemplate",
+              "metadata": {
+                "labels": {
+                  "app": "test-mpi-run"
+                },
+                "name": "test-mpi-run-rdma"
+              },
+              "spec": {
+                "spec": {
+                  "devices": {
+                    "requests": [
+                      {
+                        "exactly": {
+                          "count": 8,
+                          "deviceClassName": "rdma.nscale.com"
+                        },
+                        "name": "rdma"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "apiVersion": "trainer.kubeflow.org/v1alpha1",
+              "kind": "TrainingRuntime",
+              "metadata": {
+                "name": "test-mpi-run-runtime"
+              },
+              "spec": {
+                "template": {
+                  "spec": {
+                    "replicatedJobs": [
+                      {
+                        "name": "node",
+                        "template": {
+                          "spec": {
+                            "template": {
+                              "spec": {
+                                "containers": [
+                                  {
+                                    "name": "node",
+                                    "resources": {
+                                      "claims": [
+                                        {
+                                          "name": "gpu"
+                                        },
+                                        {
+                                          "name": "rdma"
+                                        }
+                                      ],
+                                      "limits": {
+                                        "nvidia.com/gpu": null
+                                      },
+                                      "requests": {
+                                        "nvidia.com/gpu": null
+                                      }
+                                    }
+                                  }
+                                ],
+                                "resourceClaims": [
+                                  {
+                                    "name": "gpu",
+                                    "resourceClaimTemplateName": "test-mpi-run-gpu"
+                                  },
+                                  {
+                                    "name": "rdma",
+                                    "resourceClaimTemplateName": "test-mpi-run-rdma"
+                                  }
+                                ],
+                                "tolerations": [
+                                  {
+                                    "effect": "NoSchedule",
+                                    "key": "kubernetes.io/arch",
+                                    "operator": "Equal",
+                                    "value": "arm64"
+                                  },
+                                  {
+                                    "effect": "NoSchedule",
+                                    "key": "nvidia.com/gpu",
+                                    "operator": "Equal",
+                                    "value": "present"
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "when": {
+            "gpuArchitecture": {
+              "in": [
+                "b200",
+                "gb300"
+              ]
+            },
+            "platform": {
+              "equals": "nscale"
+            }
+          }
         }
       ]
     },
@@ -1257,6 +1522,9 @@
         "totalGroups": 0,
         "detectedPlatform": "aws",
         "detectedGPUArchitecture": "gb200",
+        "gpuProducts": [
+          "NVIDIA-GB200-NVL72"
+        ],
         "appliedOverrides": [
           {
             "index": 0,
@@ -1269,21 +1537,15 @@
             "patches": "orchestration"
           },
           {
-            "index": 4,
-            "when": "platform=aws",
-            "patches": "none",
-            "noOp": true
-          },
-          {
-            "index": 5,
-            "when": "platform=aws",
-            "patches": "none",
-            "noOp": true
-          },
-          {
             "index": 7,
             "when": "gpuArchitecture=gb200, platform=aws",
             "patches": "1 dependencies"
+          },
+          {
+            "index": 8,
+            "when": "gpuArchitecture=gb200, platform=aws",
+            "patches": "none",
+            "noOp": true
           }
         ]
       }

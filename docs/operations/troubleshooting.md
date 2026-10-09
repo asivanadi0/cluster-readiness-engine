@@ -66,6 +66,7 @@ kubectl logs -n nvcre deploy/nvcre-manager \
 - The `InProgress` condition has reason `WorkloadPending` — the workload is queued, not stuck. On Kueue-managed clusters the TrainJob is created with `spec.suspend: true` and held until quota is admitted. NVCRE waits without counting queued time against `timeoutPerJob` or stall detection; check the queue (`kubectl get workloads -A` for Kueue) to see why admission is not happening.
 - The workload resource exists but is not completing — check Kubeflow Trainer logs and pod events.
 - Pods are `Pending` — verify GPU resources are available on target nodes (`kubectl describe node <node>`).
+- The `InProgress` condition has reason `WorkloadSchedulingBlocked` — the workload is admitted but its pods cannot be placed (e.g. GPUs held by another tenant). The condition message relays the scheduler's own diagnosis (also shown on the Workflow as reason `JobSchedulingBlocked` and as a `Blocked:` line in `nvcrectl certification report`); blocked time does not count against `timeoutPerJob` or stall detection. Tune with `spec.schedulingStallGraceSeconds` (default 5m).
 - Kubeflow Trainer is not running — confirm its pods are healthy (`kubectl get pods -n kubeflow-system`).
 
 ## Workflow stuck without a Job
@@ -258,6 +259,32 @@ kubectl logs <pod-name> | head -50
 - The regex does not match the NCCL output format — verify the regex against actual log output. NCCL test output format varies between versions.
 - The workload has not produced output yet — bandwidth results appear only after the NCCL test completes its message-size sweep.
 - The `replicatedJobName` is wrong — for MPI workloads, set `workerStrategy.replicatedJobName: launcher` in the LogProfile since NCCL output goes to the launcher pod.
+- The `logProfileRef` does not name an existing LogProfile — check `kubectl get logprofile <name>`; LogProfiles are cluster-scoped.
+- The LogProfile's `containerName` names no container in the launcher pod — the log read fails with an error from the API server. Leave it empty to read the pod's only container.
+
+## Bandwidth threshold fails with MeasurementTimeout
+
+**Symptoms:** A Job succeeded, but `ValidationFailed` is `True` with reason `MeasurementTimeout` for `busBandwidthGBps` or `algBandwidthGBps`, and its BandwidthMeasurement is `Complete` with reason `LogsUnavailable` or `NoDataCollected`.
+
+Bandwidth thresholds are evaluated only against final results, read from the launcher's full log after the Job succeeds. The measurement could not produce them, so the value stays unmeasured and validation fails once `measurementTimeout` expires.
+
+**Diagnosis:**
+
+```bash
+# The Complete condition's message names the cause
+kubectl get bandwidthmeasurement <name> -o jsonpath='{.status.conditions[?(@.type=="Complete")]}'
+
+# Retries of the final read are recorded as Warning events
+kubectl get events --field-selector involvedObject.name=<name>
+```
+
+**Solutions:**
+
+- `LogsUnavailable` with an error reading the pod log — the launcher pod or its log was gone or unreachable for the whole retry period, or the LogProfile's `containerName` names no container in the pod. Check that nothing deletes the TrainJob or its pods before thresholds are evaluated, and that the controller can reach the kubelet for `pods/log`. If the log is only slow to become readable, raise `measurementTimeout`; the read is retried for as long as the Job waits (see [BandwidthMeasurement](../api-reference/bandwidth-measurement.md#how-it-works) for where to set it).
+- `LogsUnavailable` with an error naming the LogProfile (`getting LogProfile ...`, a pattern that does not compile) or a missing pod (`no pods found for ... replicatedJob ...`) — the measurement never found the log to read. Check `logProfileRef` and `workerStrategy.replicatedJobName` as described in [BandwidthMeasurement not reporting results](#bandwidthmeasurement-not-reporting-results).
+- `LogsUnavailable` because the log cannot be read in full — for example a line longer than 1 MiB. Retrying cannot help; reduce the workload's log output.
+- `LogsUnavailable` because the referenced Job no longer exists — it was deleted, or replaced when its group was retried. The replacement Job gets its own BandwidthMeasurement.
+- `NoDataCollected` — the whole log was read but no line matched the `bandwidthResult` pattern. See [BandwidthMeasurement not reporting results](#bandwidthmeasurement-not-reporting-results).
 
 ## Enable debug logging
 

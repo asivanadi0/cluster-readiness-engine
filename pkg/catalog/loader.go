@@ -21,17 +21,21 @@ import (
 
 // Default values for template variables when not specified by the user.
 const (
-	DefaultMaxSteps           = 50
-	DefaultExitDurationMins   = 30
-	DefaultSaveInterval       = 250
-	DefaultSaveRetainInterval = 1000
-	DefaultSaveTopK           = 1
-	DefaultStorageSize        = "10Ti"
-	DefaultTestScale          = nvcrev1alpha1.TestScaleFullScale
-	DefaultMaxBytes           = "16G"
-	DefaultNumIterations      = 100
-	DefaultNumCycles          = 10
-	DefaultMinGroupSize       = 2
+	DefaultMaxSteps         = 50
+	DefaultExitDurationMins = 30
+	// DefaultStartupStallTimeoutSeconds is the entry-level default for the
+	// generated Job's startup-stall window. Templates use:
+	// {{ .StartupStallTimeoutSeconds }}
+	DefaultStartupStallTimeoutSeconds = 1200
+	DefaultSaveInterval               = 250
+	DefaultSaveRetainInterval         = 1000
+	DefaultSaveTopK                   = 1
+	DefaultStorageSize                = "10Ti"
+	DefaultTestScale                  = nvcrev1alpha1.TestScaleFullScale
+	DefaultMaxBytes                   = "16G"
+	DefaultNumIterations              = 100
+	DefaultNumCycles                  = 10
+	DefaultMinGroupSize               = 2
 
 	// Training container resource defaults (DGX-class sizing). Overridable
 	// per value via CategoryOptions.resources (issue #83).
@@ -61,7 +65,23 @@ const (
 	// DefaultTimeoutPerJob is the default timeout for communication jobs.
 	// Prevents pods from running indefinitely on launcher restarts.
 	DefaultTimeoutPerJob = "1h"
+
+	// GKETCPXONICsPerNode is the GPU NIC count TCPXO uses on an
+	// a3-megagpu-8g node, one per GPU. It matches --num_nics and
+	// NCCL_FASTRAK_IFNAME in the GCP H100 TCPXO templates.
+	GKETCPXONICsPerNode = 8
 )
+
+// DefaultGKETCPXONetworks returns the GKE Network names the GCP H100 TCPXO
+// patch renders when none were detected: gpu-nic0 through gpu-nic7, the names
+// the catalog hardcoded before detection existed (issue #432).
+func DefaultGKETCPXONetworks() []string {
+	names := make([]string, GKETCPXONICsPerNode)
+	for i := range names {
+		names[i] = fmt.Sprintf("gpu-nic%d", i)
+	}
+	return names
+}
 
 //go:embed all:entries
 var entriesFS embed.FS
@@ -92,13 +112,34 @@ type TemplateData struct {
 	GpusPerNode int32
 
 	// MlnxPerNode is the Mellanox NIC count per node for IB/RoCE platforms.
-	// 0 means omit nvidia.com/mlnxnics. Templates use: {{ .MlnxPerNode }}
+	// 0 means omit nvidia.com/mlnxnics: templates use
+	// {{- if gt (int .MlnxPerNode) 0 }} around the request (and, on OCI, the
+	// network attachment annotation). Templates use: {{ .MlnxPerNode }}
 	MlnxPerNode int32
 
 	// NicResourceName is the extended resource name of the RDMA NIC devices
 	// for the on-prem GB200/GB300 templates. Empty means omit the NIC resource
 	// block. Templates use: {{- if .NicResourceName }} ... {{ .NicResourceName }}
 	NicResourceName string
+
+	// GKETCPXONetworks are the GKE Network names the GCP H100 TCPXO patch
+	// attaches to the pod as eth1..eth8, in that order (always
+	// GKETCPXONICsPerNode entries at Build time: detected, or
+	// DefaultGKETCPXONetworks). Templates use:
+	// {{ range $i, $n := .GKETCPXONetworks }} ... eth{{ add $i 1 }} ... {{ $n }}
+	GKETCPXONetworks []string
+
+	// GCPH100NCCLImage, GCPH100TrainingImage and TCPXODaemonImage are the
+	// images the GCP H100 TCPXO overrides render, selected by the detected
+	// TCPXO plugin version (always non-empty at Build time: from
+	// TCPXOPluginProfileFor, which falls back for unmapped versions). Templates use:
+	// {{ .GCPH100NCCLImage }}, {{ .GCPH100TrainingImage }}, {{ .TCPXODaemonImage }}.
+	// TCPXODaemonArgs are the daemon entrypoint flags for that daemon
+	// release: {{ .TCPXODaemonArgs }}
+	GCPH100NCCLImage     string
+	GCPH100TrainingImage string
+	TCPXODaemonImage     string
+	TCPXODaemonArgs      string
 
 	// TrainingCPULimit is the CPU limit for training containers
 	// (always non-empty after defaults). Templates use: {{ .TrainingCPULimit }}
@@ -131,6 +172,11 @@ type TemplateData struct {
 	// ExitDurationMins is the training duration in minutes (always non-zero after defaults).
 	// Templates use: {{ .ExitDurationMins }}
 	ExitDurationMins int32
+
+	// StartupStallTimeoutSeconds is the startup-stall window in seconds for the
+	// generated Job (always non-zero after defaults).
+	// Templates use: {{ .StartupStallTimeoutSeconds }}
+	StartupStallTimeoutSeconds int32
 
 	// GPUArchitecture is the GPU architecture string (e.g., "h100", "gb200").
 	// Templates use: {{ .GPUArchitecture }}
@@ -264,6 +310,7 @@ func TemplateFuncs() template.FuncMap {
 				return 0
 			}
 		},
+		"add":       func(a, b int) int { return a + b },
 		"mul":       func(a, b int) int { return a * b },
 		"toYaml":    toYaml,
 		"toMpiArgs": toMpiArgs,
@@ -430,37 +477,50 @@ func loadAndRegisterEntries() error {
 // buildTemplateData creates a TemplateData from BuildConfig, applying defaults for unset fields.
 func buildTemplateData(config BuildConfig, configArch, variant string, meta entryMeta) TemplateData {
 	td := TemplateData{
-		ImagePullSecrets:   config.ImagePullSecrets,
-		NodesPerJob:        config.NodesPerJob,
-		GpusPerNode:        config.GpusPerNode,
-		MlnxPerNode:        config.MlnxPerNode,
-		NicResourceName:    config.NicResourceName,
-		EnableMNNVL:        config.EnableMNNVL,
-		EnableCheckpoint:   config.EnableCheckpoint,
-		MaxSteps:           config.MaxSteps,
-		ExitDurationMins:   config.ExitDurationMins,
-		GPUArchitecture:    config.GPUArchitecture,
-		ConfigArch:         configArch,
-		EntryName:          variant,
-		SaveInterval:       config.SaveInterval,
-		SaveRetainInterval: config.SaveRetainInterval,
-		SaveTopK:           config.SaveTopK,
-		TestScale:          config.TestScale,
-		MaxBytes:           config.MaxBytes,
-		NumIterations:      config.NumIterations,
-		NumCycles:          config.NumCycles,
-		MaxConcurrent:      config.MaxConcurrent,
-		MinGroupSize:       config.MinGroupSize,
-		TimeoutPerJob:      config.TimeoutPerJob,
-		MeasurementTimeout: config.MeasurementTimeout,
-		Thresholds:         config.Thresholds,
-		SourceRepo:         config.SourceRepo,
+		ImagePullSecrets:           config.ImagePullSecrets,
+		NodesPerJob:                config.NodesPerJob,
+		GpusPerNode:                config.GpusPerNode,
+		MlnxPerNode:                config.MlnxPerNode,
+		NicResourceName:            config.NicResourceName,
+		GKETCPXONetworks:           config.GKETCPXONetworks,
+		EnableMNNVL:                config.EnableMNNVL,
+		EnableCheckpoint:           config.EnableCheckpoint,
+		MaxSteps:                   config.MaxSteps,
+		ExitDurationMins:           config.ExitDurationMins,
+		StartupStallTimeoutSeconds: config.StartupStallTimeoutSeconds,
+		GPUArchitecture:            config.GPUArchitecture,
+		ConfigArch:                 configArch,
+		EntryName:                  variant,
+		SaveInterval:               config.SaveInterval,
+		SaveRetainInterval:         config.SaveRetainInterval,
+		SaveTopK:                   config.SaveTopK,
+		TestScale:                  config.TestScale,
+		MaxBytes:                   config.MaxBytes,
+		NumIterations:              config.NumIterations,
+		NumCycles:                  config.NumCycles,
+		MaxConcurrent:              config.MaxConcurrent,
+		MinGroupSize:               config.MinGroupSize,
+		TimeoutPerJob:              config.TimeoutPerJob,
+		MeasurementTimeout:         config.MeasurementTimeout,
+		Thresholds:                 config.Thresholds,
+		SourceRepo:                 config.SourceRepo,
 	}
+	if len(td.GKETCPXONetworks) == 0 {
+		td.GKETCPXONetworks = DefaultGKETCPXONetworks()
+	}
+	tcpxo, _, _ := TCPXOPluginProfileFor(config.TCPXOPluginVersion)
+	td.GCPH100NCCLImage = tcpxo.NCCLImage
+	td.GCPH100TrainingImage = tcpxo.TrainingImage
+	td.TCPXODaemonImage = tcpxo.DaemonImage
+	td.TCPXODaemonArgs = tcpxo.DaemonArgs
 	if td.MaxSteps == 0 {
 		td.MaxSteps = DefaultMaxSteps
 	}
 	if td.ExitDurationMins == 0 {
 		td.ExitDurationMins = DefaultExitDurationMins
+	}
+	if td.StartupStallTimeoutSeconds == 0 {
+		td.StartupStallTimeoutSeconds = DefaultStartupStallTimeoutSeconds
 	}
 	if td.SaveInterval == 0 {
 		td.SaveInterval = DefaultSaveInterval

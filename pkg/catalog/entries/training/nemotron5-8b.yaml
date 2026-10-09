@@ -4,7 +4,7 @@
 jobTemplate:
   spec:
     stallMultiplier: 3
-    startupStallTimeoutSeconds: 1200
+    startupStallTimeoutSeconds: {{ .StartupStallTimeoutSeconds }}
 {{- if .EnableCheckpoint }}
     checkpoint:
       pvcName: nemotron5-8b-pvc
@@ -208,10 +208,17 @@ dependencies:
     train.sh: |
 {{ includeTemplate "configs/train.sh" . | indent 6 }}
 overrides:
-# --- AWS (NCCL plugin cleanup) ---
+# --- AWS + GB300 (NCCL plugin cleanup) ---
+# AWS GB300 uses a RoCE fabric and has no EFA devices, so the AWS-OFI-NCCL
+# plugin shipped in the pytorch image finds no eligible provider and aborts.
+# Scoped to gb300 on purpose: H100 and GB200 on AWS are EFA fabrics, and EFA is
+# reachable only through libfabric via this plugin (NCCL's built-in net_ib does
+# not drive EFA). Stripping it there silently drops NCCL to TCP over eth0.
 - when:
     platform:
       equals: aws
+    gpuArchitecture:
+      equals: gb300
   jobTemplate:
     spec:
       workload:
@@ -295,6 +302,14 @@ overrides:
       equals: gb200
   dependencies:
 {{ lib "deps/aws-gb200-efa-resources-training.yaml" . | indent 2 }}
+  jobTemplate:
+    spec:
+      workload:
+        trainJob:
+          trainer:
+            env:
+{{ lib "nccl/aws-gb200-efa-training-env.yaml" . | indent 12 }}
+{{ lib "nccl/aws-gb200-training-tuning-env.yaml" . | indent 12 }}
 # --- AWS + H100 (8 GPUs, TP=8) ---
 - when:
     platform:
@@ -303,7 +318,19 @@ overrides:
       equals: h100
   dependencies:
 {{ lib "deps/aws-h100-efa-resources-training.yaml" . | indent 2 }}
-# --- GCP + H100 (TCPxo/FastRak) ---
+  jobTemplate:
+    spec:
+      workload:
+        trainJob:
+          trainer:
+            env:
+{{ lib "nccl/aws-h100-efa-training-env.yaml" . | indent 12 }}
+            # Fused attention is disabled in the runtime base env for broad
+            # compatibility; H100 supports it and the kernel is a large win.
+            # Kubeflow upserts trainer env over runtime env by name.
+            - name: NVTE_FUSED_ATTN
+              value: "1"
+# --- GCP + H100 (TCPxo/FastRak, image from the TCPXO plugin version) ---
 - when:
     platform:
       equals: gcp
@@ -311,13 +338,22 @@ overrides:
       equals: h100
   dependencies:
 {{ lib "deps/gcp-h100-tcpxo-runtime-patch.yaml" . | indent 2 }}
+{{ lib "deps/gcp-h100-training-image-patch.yaml" . | indent 2 }}
   jobTemplate:
     spec:
       workload:
         trainJob:
           trainer:
+            image: {{ .GCPH100TrainingImage }}
             env:
 {{ lib "nccl/gcp-h100-fastrak-env.yaml" . | indent 12 }}
+            # GKE mounts the driver at /usr/local/nvidia/lib64 (on
+            # LD_LIBRARY_PATH), but the NGC image's ldconfig cache points
+            # libcuda.so.1 at a CUDA compat path that does not exist in the
+            # pod, and Triton trusts ldconfig over LD_LIBRARY_PATH, so
+            # Megatron's import fails with "libcuda.so cannot found!".
+            - name: TRITON_LIBCUDA_PATH
+              value: /usr/local/nvidia/lib64
 # --- Azure + A100 (InfiniBand) ---
 - when:
     platform:
@@ -453,3 +489,41 @@ overrides:
       in: [gb200, gb300]
   dependencies:
 {{ lib "deps/onprem-gb200-gb300-runtime-patch-training.yaml" . | indent 2 }}
+# --- GCP + RTX PRO 6000 (G4 TCP; 8B training on 4-GPU nodes) ---
+- when:
+    platform:
+      equals: gcp
+    gpuArchitecture:
+      equals: rtxpro6000
+  dependencies:
+{{ lib "deps/gcp-rtxpro6000-runtime-patch.yaml" . | indent 2 }}
+  jobTemplate:
+    spec:
+      workload:
+        trainJob:
+          trainer:
+            env:
+{{ lib "nccl/gcp-rtxpro6000-tcp-env.yaml" . | indent 12 }}
+# --- Nscale NKS (GPU+RDMA DRA claims, InfiniBand; ADR-085) ---
+# Deps-only like the on-prem block: torchrun inherits the runtime container
+# env, so the portable IB env rides there (merged by name into the base env)
+# alongside the gpu.nvidia.com/rdma.nscale.com claims.
+- when:
+    platform:
+      equals: nscale
+    gpuArchitecture:
+      in: [b200, gb300]
+  dependencies:
+{{ lib "deps/nscale-gpu-rdma-training.yaml" . | indent 2 }}
+# --- Nscale + GB300 topology key (ADR-085) ---
+# Nscale runs no GFD, so nvidia.com/gpu.clique from the GB200/GB300 block
+# above never exists there; the NVLink domain is published as
+# topology.nks.nscale.com/accelerator-domain instead.
+- when:
+    platform:
+      equals: nscale
+    gpuArchitecture:
+      equals: gb300
+  orchestration:
+    topology:
+      topologyKey: topology.nks.nscale.com/accelerator-domain

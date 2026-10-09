@@ -28,7 +28,7 @@
                       - path: /dev/nvidia-uvm
                       - path: /dev/dmabuf_import_helper
                     networking.gke.io/default-interface: eth0
-                    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"},{"interfaceName":"eth1","network":"gpu-nic0"},{"interfaceName":"eth2","network":"gpu-nic1"},{"interfaceName":"eth3","network":"gpu-nic2"},{"interfaceName":"eth4","network":"gpu-nic3"},{"interfaceName":"eth5","network":"gpu-nic4"},{"interfaceName":"eth6","network":"gpu-nic5"},{"interfaceName":"eth7","network":"gpu-nic6"},{"interfaceName":"eth8","network":"gpu-nic7"}]'
+                    networking.gke.io/interfaces: '[{"interfaceName":"eth0","network":"default"}{{ range $i, $n := .GKETCPXONetworks }},{"interfaceName":"eth{{ add $i 1 }}","network":"{{ $n }}"}{{ end }}]'
                 spec:
                   containers:
                   - name: node
@@ -40,7 +40,7 @@
                       mountPath: /dev/aperture_devices
                   initContainers:
                   - name: tcpxo-daemon
-                    image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.8
+                    image: {{ .TCPXODaemonImage }}
                     imagePullPolicy: Always
                     restartPolicy: Always
                     command: ["/bin/sh", "-c"]
@@ -48,10 +48,14 @@
                     - |
                       set -ex
                       chmod 755 /fts/entrypoint_rxdm_container.sh
-                      /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8 --uid= --alsologtostderr --enforce_kernel_ipv6_support=false
+                      /fts/entrypoint_rxdm_container.sh {{ .TCPXODaemonArgs }}
+                    # Kubernetes capability names carry no CAP_ prefix:
+                    # containerd silently drops "CAP_NET_ADMIN". Daemon
+                    # v1.0.21 and later tune the GPU NICs with ethtool at
+                    # start and exit on the resulting EPERM without it.
                     securityContext:
                       capabilities:
-                        add: ["CAP_NET_ADMIN", "CAP_NET_BIND_SERVICE"]
+                        add: ["NET_ADMIN", "NET_BIND_SERVICE"]
                     volumeMounts:
                     - name: nvtcpxo-libraries
                       mountPath: /usr/local/nvidia

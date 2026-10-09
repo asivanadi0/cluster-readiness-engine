@@ -13,6 +13,7 @@ import (
 	"text/template"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 
 	nvcrev1alpha1 "github.com/NVIDIA/cluster-readiness-engine/api/v1alpha1"
@@ -95,6 +96,155 @@ func TestBuildOverridesRendersForEveryPlatform(t *testing.T) {
 		tc.Actual = string(b) + "\n"
 		return nil
 	})
+}
+
+func TestBuildOverridesPreservesWorkloadRunUserEnv(t *testing.T) {
+	overrides := BuildOverrides(OverrideConfig{
+		FrameworkType: "torch",
+		UserEnv: []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "TRACE"},
+			{Name: "FI_PROVIDER", Value: "user-provider"},
+			{Name: "USER_ONLY", Value: "kept"},
+			{Name: "PET_NNODES", Value: "2"},
+		},
+	})
+
+	// The contract is per name, not per patch: a platform patch that sets a name
+	// the user also set must carry the user's value, and no patch may carry a
+	// user-only name.
+	//
+	// NCCL_DEBUG and FI_PROVIDER are both listed above so the first half cannot
+	// pass vacuously. Every platform fragment used to set NCCL_DEBUG, so naming
+	// it alone happened to exercise every patch; that is incidental, and the AWS
+	// EFA transport fragment sets FI_PROVIDER and no NCCL_DEBUG (the controller
+	// and BaseNCCLEnvVars already supply the latter). Asserting the union keeps
+	// the override path covered on both kinds of fragment.
+	userValues := map[string]string{"NCCL_DEBUG": "TRACE", "FI_PROVIDER": "user-provider"}
+
+	seen := map[string]bool{}
+	trainerPatches := 0
+	for _, override := range overrides {
+		if override.JobTemplate == nil {
+			continue
+		}
+		var root map[string]any
+		require.NoError(t, json.Unmarshal(override.JobTemplate.Raw, &root))
+		trainer, ok := nestedOverrideMap(root, "spec", "workload", "trainJob", "trainer")
+		if !ok {
+			continue
+		}
+		trainerPatches++
+		var env []corev1.EnvVar
+		envJSON, err := json.Marshal(trainer["env"])
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(envJSON, &env))
+		for _, e := range env {
+			want, conflicts := userValues[e.Name]
+			if !conflicts {
+				continue
+			}
+			require.Equal(t, want, e.Value,
+				"platform patch overwrote the user's %s", e.Name)
+			seen[e.Name] = true
+		}
+		assertNoEnvValue(t, env, "USER_ONLY")
+		assertNoEnvValue(t, env, "PET_NNODES")
+	}
+
+	require.NotZero(t, trainerPatches, "expected at least one trainer.env platform override")
+
+	// Every conflicting name must have been found on some patch. Without this,
+	// a fragment that stopped emitting a name would silently empty the loop
+	// above and the test would still pass.
+	for name := range userValues {
+		require.True(t, seen[name],
+			"no platform trainer.env patch set %s, so user-env precedence went unchecked for it", name)
+	}
+
+	runtimePatches := 0
+	for _, override := range overrides {
+		for _, dependency := range override.Dependencies {
+			var root map[string]any
+			require.NoError(t, json.Unmarshal(dependency.Raw, &root))
+			kind, _ := root["kind"].(string)
+			if kind != kindTrainingRuntime {
+				continue
+			}
+			runtimeSpec, ok := nestedOverrideMap(root, "spec", "template", "spec")
+			if !ok {
+				continue
+			}
+			replicatedJobs, ok := runtimeSpec["replicatedJobs"].([]any)
+			if !ok {
+				continue
+			}
+			for _, rawJob := range replicatedJobs {
+				job, ok := rawJob.(map[string]any)
+				if !ok {
+					continue
+				}
+				podSpec, ok := nestedOverrideMap(job, "template", "spec", "template", "spec")
+				if !ok {
+					continue
+				}
+				containers, ok := podSpec["containers"].([]any)
+				if !ok {
+					continue
+				}
+				for _, rawContainer := range containers {
+					container, ok := rawContainer.(map[string]any)
+					if !ok {
+						continue
+					}
+					rawEnv, ok := container["env"]
+					if !ok {
+						continue
+					}
+					envJSON, err := json.Marshal(rawEnv)
+					require.NoError(t, err)
+					var env []corev1.EnvVar
+					require.NoError(t, json.Unmarshal(envJSON, &env))
+					if !hasEnvName(env, "NCCL_DEBUG") {
+						continue
+					}
+					assertEnvValue(t, env, "NCCL_DEBUG", "TRACE")
+					assertNoEnvValue(t, env, "USER_ONLY")
+					assertNoEnvValue(t, env, "PET_NNODES")
+					runtimePatches++
+				}
+			}
+		}
+	}
+	require.NotZero(t, runtimePatches, "expected at least one TrainingRuntime container env override")
+}
+
+func hasEnvName(env []corev1.EnvVar, name string) bool {
+	for _, got := range env {
+		if got.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func assertNoEnvValue(t *testing.T, env []corev1.EnvVar, name string) {
+	t.Helper()
+	for _, got := range env {
+		if got.Name == name {
+			t.Fatalf("did not expect %s in trainer env: %#v", name, env)
+		}
+	}
+}
+
+func assertEnvValue(t *testing.T, env []corev1.EnvVar, name, want string) {
+	t.Helper()
+	for _, got := range env {
+		if got.Name == name {
+			require.Equal(t, want, got.Value)
+			return
+		}
+	}
+	t.Fatalf("expected %s=%s in trainer env: %#v", name, want, env)
 }
 
 // TestBuildOverridesMPIArgs records every rendered override that carries
